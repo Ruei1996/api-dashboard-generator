@@ -1,0 +1,19 @@
+## .gitignore for Repo-Insight-Dashboard
+
+# Build output
+**/bin/
+**/obj/
+
+# IDE
+.vs/
+.idea/
+*.user
+
+# macOS
+.DS_Store
+
+# Generated outputs (do not commit)
+Downloads/
+
+# Secrets
+*.env
