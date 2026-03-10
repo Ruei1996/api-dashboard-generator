@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="RepoInsightDashboard.Tests/RepoInsightDashboard.Tests.csproj" />
+  <Project Path="RepoInsightDashboard/RepoInsightDashboard.csproj" />
+</Solution>
