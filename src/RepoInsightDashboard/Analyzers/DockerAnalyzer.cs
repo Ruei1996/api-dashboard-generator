@@ -193,4 +193,48 @@ public class DockerAnalyzer
             !f.IsDirectory && f.Name.Equals("Dockerfile", StringComparison.OrdinalIgnoreCase));
         return dockerfile != null ? ParseDockerfile(dockerfile) : null;
     }
+
+    /// <summary>
+    /// When no docker-compose exists, synthesize ContainerInfo from Dockerfile EXPOSE ports.
+    /// </summary>
+    public List<ContainerInfo> SynthesizeContainersFromDockerfile(DockerfileInfo info, string projectName)
+    {
+        if (info.ExposedPorts.Count == 0) return [];
+
+        var container = new ContainerInfo
+        {
+            Name = projectName,
+            Image = $"build:{projectName}",
+            DockerfilePath = info.FilePath,
+            BuildContext = "."
+        };
+
+        foreach (var port in info.ExposedPorts)
+        {
+            // Common convention: guess protocol based on port range
+            var desc = port switch
+            {
+                >= 50000 => "gRPC",
+                >= 10000 and < 20000 => "HTTP/gRPC-Gateway",
+                >= 20000 and < 30000 => "gRPC",
+                443 or 8443 => "HTTPS",
+                80 or 8080 or 3000 or 4000 => "HTTP",
+                5432 => "PostgreSQL",
+                6379 => "Redis",
+                _ => "Service"
+            };
+            container.Ports.Add(new PortMapping
+            {
+                HostPort = port,
+                ContainerPort = port,
+                Protocol = desc.Contains("gRPC") ? "grpc" : "tcp",
+                Description = desc
+            });
+        }
+
+        foreach (var env in info.EnvVars)
+            container.EnvVariables.Add(env);
+
+        return [container];
+    }
 }

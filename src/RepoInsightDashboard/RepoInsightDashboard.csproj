@@ -7,6 +7,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>rid</AssemblyName>
     <RootNamespace>RepoInsightDashboard</RootNamespace>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>rid</ToolCommandName>
+    <PackageId>RepoInsightDashboard</PackageId>
     <Version>1.0.0</Version>
     <Description>Repo Insight Dashboard — 程式碼庫語義分析 CLI 工具</Description>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>

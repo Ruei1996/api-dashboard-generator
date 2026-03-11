@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Encodings.Web;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Serialization;
 using RepoInsightDashboard.Analyzers;
 using RepoInsightDashboard.Models;
 
@@ -8,6 +9,12 @@ namespace RepoInsightDashboard.Generators;
 
 public class HtmlDashboardGenerator
 {
+    // camelCase for onclick data — JS expects ep.method, ep.path, c.name, etc.
+    private static readonly JsonSerializerSettings _onclickJson = new()
+    {
+        ContractResolver = new CamelCasePropertyNamesContractResolver(),
+        NullValueHandling = NullValueHandling.Ignore
+    };
     public string Generate(DashboardData data)
     {
         var sb = new StringBuilder();
@@ -38,6 +45,8 @@ public class HtmlDashboardGenerator
         sb.AppendLine(BuildEnvSection(data));
         sb.AppendLine(BuildFileTreeSection(data));
         sb.AppendLine(BuildSecuritySection(data));
+        sb.AppendLine(BuildUnitTestSection(data));
+        sb.AppendLine(BuildIntegrationTestSection(data));
         if (!string.IsNullOrEmpty(data.Project.CopilotInstructions))
             sb.AppendLine(BuildCopilotInstructionsSection(data));
         sb.AppendLine("</main>");
@@ -66,6 +75,7 @@ public class HtmlDashboardGenerator
             <span class="navbar-stat" title="Total Files">📁 {data.Project.TotalFiles}</span>
             <span class="navbar-stat" title="API Endpoints">🔌 {data.ApiEndpoints.Count} API</span>
             <span class="navbar-stat" title="Containers">🐳 {data.Containers.Count} 服務</span>
+            <button id="sidebar-toggle" class="btn-icon" title="展開/收合側欄" aria-label="Toggle Sidebar">◀</button>
             <button id="theme-toggle" class="btn-icon" title="切換主題" aria-label="切換深淺色主題">🌙</button>
             <button id="collapse-all" class="btn-icon" title="全部摺疊">⊟</button>
             <button id="expand-all" class="btn-icon" title="全部展開">⊞</button>
@@ -108,6 +118,12 @@ public class HtmlDashboardGenerator
             </a>
             <a href="#section-security" class="nav-item" data-section="security">
               <span class="nav-icon">🛡️</span> 安全分析
+            </a>
+            <a href="#section-unittests" class="nav-item" data-section="unittests">
+              <span class="nav-icon">🧪</span> 單元測試
+            </a>
+            <a href="#section-inttests" class="nav-item" data-section="inttests">
+              <span class="nav-icon">⚗️</span> 整合測試
             </a>
           </nav>
         </aside>
@@ -354,7 +370,7 @@ public class HtmlDashboardGenerator
             <tr class="searchable api-row {(e.IsDeprecated ? "deprecated" : "")}"
                 data-text="{HtmlEncode(e.Method)} {HtmlEncode(e.Path)} {HtmlEncode(e.Summary)}"
                 data-tag="{HtmlEncode(e.Tag ?? "")}"
-                onclick="showApiDetail({JsonConvert.SerializeObject(e).Replace("\"", "&quot;")})"
+                onclick="openApiDetailTab({JsonConvert.SerializeObject(e, _onclickJson).Replace("\"", "&quot;")}, window.__RID_DATA__)"
                 style="cursor:pointer">
               <td><span class="method-badge method-{HtmlEncode(e.Method.ToLowerInvariant())}">{HtmlEncode(e.Method)}</span></td>
               <td><code class="path">{HtmlEncode(e.Path)}</code></td>
@@ -397,7 +413,7 @@ public class HtmlDashboardGenerator
                 <tbody>{rows}</tbody>
               </table>
             </div>
-            <p class="text-secondary" style="font-size:12px;margin-top:8px">點擊任一行查看參數詳情</p>
+            <p class="text-secondary" style="font-size:12px;margin-top:8px">點擊任一行 → 開新頁查看執行路徑、邏輯與 SQL</p>
             """;
 
         return BuildSection("api", $"API 端點 ({data.ApiEndpoints.Count})", "🔌", content);
@@ -410,7 +426,7 @@ public class HtmlDashboardGenerator
 
         var mermaid = BuildDockerMermaid(data);
         var cards = string.Join("\n", data.Containers.Select(c => $"""
-            <div class="container-card" onclick="showContainerDetail({JsonConvert.SerializeObject(c).Replace("\"", "&quot;")})"
+            <div class="container-card" onclick="showContainerDetail({JsonConvert.SerializeObject(c, _onclickJson).Replace("\"", "&quot;")})"
                  style="cursor:pointer" title="點擊查看詳情">
               <div class="container-header">
                 <span class="container-icon">🐳</span>
@@ -677,6 +693,99 @@ public class HtmlDashboardGenerator
         return BuildSection("security", $"安全分析 ({data.SecurityRisks.Count})", "🛡️", items);
     }
 
+    private string BuildUnitTestSection(DashboardData data)
+    {
+        var unitFiles = data.Tests.UnitTests;
+        var unitCount = unitFiles.Sum(f => f.TestCases.Count);
+
+        if (unitCount == 0 && unitFiles.Count == 0)
+            return BuildSection("unittests", "單元測試", "🧪",
+                "<p class=\"text-secondary\">未偵測到單元測試檔案。</p>", true);
+
+        var statCards = $"""
+            <div class="stats-grid" style="grid-template-columns:repeat(auto-fill,minmax(120px,1fr));margin-bottom:16px">
+              <div class="stat-card"><div class="stat-value">{unitFiles.Count}</div><div class="stat-label">測試檔案</div></div>
+              <div class="stat-card"><div class="stat-value">{unitCount}</div><div class="stat-label">測試函式</div></div>
+              <div class="stat-card"><div class="stat-value">{unitFiles.Sum(f => f.TestCases.Count(t => t.HasSubtests))}</div><div class="stat-label">含子測試</div></div>
+              <div class="stat-card"><div class="stat-value">{data.Tests.Mocks.Count}</div><div class="stat-label">Mock 物件</div></div>
+            </div>
+            """;
+
+        var rows = string.Join("\n", unitFiles.Select(f => {
+            var cases = string.Join("", f.TestCases.Select(tc =>
+                $"<li class='test-case' title='{HtmlEncode(tc.Description ?? "")}'>" +
+                $"<span class='test-icon'>✓</span> {HtmlEncode(tc.Name)}" +
+                (tc.HasSubtests ? $" <span class='tag tag-blue'>{tc.Subtests.Count} 子測試</span>" : "") +
+                "</li>"));
+            return $"""
+                <div class="test-file-card">
+                  <div class="test-file-header" onclick="this.nextElementSibling.classList.toggle('collapsed')">
+                    <span class="test-file-icon">📄</span>
+                    <code class="test-file-path">{HtmlEncode(f.FilePath)}</code>
+                    <span class="tag tag-green">{f.TestCases.Count} tests</span>
+                  </div>
+                  <ul class="test-case-list">{cases}</ul>
+                </div>
+                """;
+        }));
+
+        var mockRows = data.Tests.Mocks.Count > 0
+            ? $"<h4 style=\"margin:16px 0 8px;font-size:13px\">Mock 物件 ({data.Tests.Mocks.Count})</h4>" +
+              $"<div class=\"mock-grid\">{string.Join("", data.Tests.Mocks.Select(m =>
+                $"<div class='mock-card'><strong>{HtmlEncode(m.Name)}</strong><div class='text-secondary' style='font-size:11px'>{HtmlEncode(m.FilePath)}</div><div style='margin-top:4px'>{string.Join(" ", m.Methods.Take(5).Select(met => $"<span class='tag tag-purple'>{HtmlEncode(met)}</span>"))}</div></div>"))}</div>"
+            : "";
+
+        var content = statCards + rows + mockRows;
+        return BuildSection("unittests", $"單元測試 ({unitCount} tests / {unitFiles.Count} 檔案)", "🧪", content, true);
+    }
+
+    private string BuildIntegrationTestSection(DashboardData data)
+    {
+        var intFiles = data.Tests.IntegrationTests;
+        var accFiles = data.Tests.AcceptanceTests;
+        var intCount = intFiles.Sum(f => f.TestCases.Count);
+        var accCount = accFiles.Sum(f => f.TestCases.Count);
+        var total = intCount + accCount;
+
+        if (total == 0)
+            return BuildSection("inttests", "整合 / 驗收測試", "⚗️",
+                "<p class=\"text-secondary\">未偵測到整合或驗收測試檔案。</p>", true);
+
+        var statCards = $"""
+            <div class="stats-grid" style="grid-template-columns:repeat(auto-fill,minmax(120px,1fr));margin-bottom:16px">
+              <div class="stat-card"><div class="stat-value">{intFiles.Count}</div><div class="stat-label">整合測試檔</div></div>
+              <div class="stat-card"><div class="stat-value">{intCount}</div><div class="stat-label">整合測試數</div></div>
+              <div class="stat-card"><div class="stat-value">{accFiles.Count}</div><div class="stat-label">驗收測試檔</div></div>
+              <div class="stat-card"><div class="stat-value">{accCount}</div><div class="stat-label">驗收測試數</div></div>
+            </div>
+            """;
+
+        string RenderFiles(List<Models.TestFile> files, string label) {
+            if (files.Count == 0) return "";
+            var rows = string.Join("\n", files.Select(f => {
+                var cases = string.Join("", f.TestCases.Select(tc =>
+                    $"<li class='test-case'><span class='test-icon'>✓</span> {HtmlEncode(tc.Name)}</li>"));
+                return $"""
+                    <div class="test-file-card">
+                      <div class="test-file-header" onclick="this.nextElementSibling.classList.toggle('collapsed')">
+                        <span class="test-file-icon">📄</span>
+                        <code class="test-file-path">{HtmlEncode(f.FilePath)}</code>
+                        <span class="tag tag-orange">{f.TestCases.Count} tests</span>
+                      </div>
+                      <ul class="test-case-list">{cases}</ul>
+                    </div>
+                    """;
+            }));
+            return $"<h4 style='margin-bottom:8px;font-size:13px;color:var(--accent-orange)'>{label}</h4>{rows}";
+        }
+
+        var content = statCards
+            + RenderFiles(intFiles, $"整合測試 ({intCount})")
+            + RenderFiles(accFiles, $"驗收測試 ({accCount})");
+
+        return BuildSection("inttests", $"整合 / 驗收測試 ({total})", "⚗️", content, true);
+    }
+
     private string BuildCopilotInstructionsSection(DashboardData data)
     {
         var content = $"""
@@ -818,15 +927,20 @@ public class HtmlDashboardGenerator
           width: var(--sidebar-width); min-width: var(--sidebar-width);
           background: var(--bg-secondary); border-right: 1px solid var(--border-color);
           position: sticky; top: var(--navbar-height); height: calc(100vh - var(--navbar-height));
-          overflow-y: auto; padding: 16px 0;
+          overflow-y: auto; overflow-x: hidden; padding: 16px 0;
+          transition: width 0.25s ease, min-width 0.25s ease, padding 0.25s ease;
         }
-        .sidebar-nav { display: flex; flex-direction: column; gap: 2px; }
+        .sidebar.sidebar-collapsed {
+          width: 0; min-width: 0; padding: 0; border-right: none; overflow: hidden;
+        }
+        .sidebar.sidebar-collapsed .sidebar-nav { opacity: 0; }
+        .sidebar-nav { display: flex; flex-direction: column; gap: 2px; transition: opacity 0.15s ease; }
         .nav-item {
           display: flex; align-items: center; gap: 8px;
           padding: 8px 16px; color: var(--text-secondary);
           border-radius: 0; text-decoration: none; font-size: 13px;
           transition: background var(--transition), color var(--transition);
-          border-left: 3px solid transparent;
+          border-left: 3px solid transparent; white-space: nowrap;
         }
         .nav-item:hover { background: var(--bg-hover); color: var(--text-primary); text-decoration: none; }
         .nav-item.active { color: var(--accent-blue); border-left-color: var(--accent-blue); background: rgba(88,166,255,0.1); }
@@ -987,6 +1101,18 @@ public class HtmlDashboardGenerator
         .ft-more { padding: 2px 4px; font-size: 11px; font-style: italic; }
         .ft-children { overflow: hidden; transition: max-height 0.2s ease; }
         .ft-children.collapsed { display: none; }
+        /* ═══ Test Sections ═══ */
+        .test-file-card { background:var(--bg-card); border:1px solid var(--border-color); border-radius:var(--radius); margin-bottom:8px; overflow:hidden; }
+        .test-file-header { display:flex; align-items:center; gap:8px; padding:10px 14px; cursor:pointer; background:var(--bg-hover); }
+        .test-file-header:hover { background:var(--bg-card); }
+        .test-file-path { font-size:11px; color:var(--accent-blue); flex:1; }
+        .test-file-icon { font-size:13px; }
+        .test-case-list { list-style:none; padding:8px 14px; display:flex; flex-direction:column; gap:4px; }
+        .test-case-list.collapsed { display:none; }
+        .test-case { display:flex; align-items:center; gap:6px; font-size:12px; padding:2px 0; }
+        .test-icon { color:var(--accent-green); font-size:11px; }
+        .mock-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:8px; margin-top:8px; }
+        .mock-card { background:var(--bg-card); border:1px solid var(--border-color); border-radius:var(--radius); padding:10px 12px; }
         /* ═══ Risk Items ═══ */
         .risk-item { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 8px; }
         .risk-critical { border-left: 3px solid var(--accent-red); }
@@ -1032,7 +1158,7 @@ public class HtmlDashboardGenerator
         </style>
         """;
 
-    private string GetInlineScripts() => $$"""
+    private string GetInlineScripts() => """
         <script>
         // ═══ Mermaid CDN inline (minimal) ═══
         // Load Mermaid from CDN with fallback to inline rendering
@@ -1074,6 +1200,16 @@ public class HtmlDashboardGenerator
             el.innerHTML = '<pre style="font-size:11px;color:var(--text-secondary);overflow:auto">' + el.textContent.trim() + '</pre>';
           });
         }
+
+        // ═══ Sidebar Toggle ═══
+        var sidebarOpen = true;
+        document.getElementById('sidebar-toggle').addEventListener('click', function() {
+          sidebarOpen = !sidebarOpen;
+          var sidebar = document.getElementById('sidebar');
+          sidebar.classList.toggle('sidebar-collapsed', !sidebarOpen);
+          this.textContent = sidebarOpen ? '◀' : '▶';
+          this.title = sidebarOpen ? '收合側欄' : '展開側欄';
+        });
 
         // ═══ Theme Toggle ═══
         var isDark = true;
@@ -1233,6 +1369,161 @@ public class HtmlDashboardGenerator
         function toggleFtNode(id) {
           var el = document.getElementById(id);
           if (el) el.classList.toggle('collapsed');
+        }
+
+        // ═══ API Detail New Tab ═══
+        function openApiDetailTab(endpoint, allData) {
+          var ep = typeof endpoint === 'string' ? JSON.parse(endpoint) : endpoint;
+          var trace = (allData && allData.apiTraces || []).find(function(t) {
+            return t.method === ep.method && t.path === ep.path;
+          });
+
+          var methodColor = {'GET':'#3fb950','POST':'#58a6ff','PUT':'#d29922','DELETE':'#f85149','PATCH':'#bc8cff'}[ep.method] || '#8b949e';
+
+          var paramsHtml = '';
+          if (ep.parameters && ep.parameters.length) {
+            paramsHtml = '<table class="dt-table"><thead><tr><th>名稱</th><th>位置</th><th>類型</th><th>必填</th><th>說明</th></tr></thead><tbody>';
+            ep.parameters.forEach(function(p) {
+              paramsHtml += '<tr><td><code>'+escHtml(p.name)+'</code></td><td>'+escHtml(p.location)+'</td><td>'+escHtml(p.type)+'</td><td>'+(p.required?'✅':'')+'</td><td>'+escHtml(p.description||'')+'</td></tr>';
+            });
+            paramsHtml += '</tbody></table>';
+          }
+
+          var responsesHtml = '';
+          if (ep.responses && ep.responses.length) {
+            responsesHtml = '<table class="dt-table"><thead><tr><th>狀態碼</th><th>說明</th></tr></thead><tbody>';
+            ep.responses.forEach(function(r) {
+              responsesHtml += '<tr><td><span class="dt-badge '+(r.statusCode.startsWith('2')?'dt-badge-green':'dt-badge-red')+'">'+escHtml(r.statusCode)+'</span></td><td>'+escHtml(r.description)+'</td></tr>';
+            });
+            responsesHtml += '</tbody></table>';
+          }
+
+          // Build trace HTML
+          var traceHtml = '<p style="color:#8b949e;font-size:13px">⚠ 未偵測到此 API 的執行路徑。請確認原始碼中有對應的 handler 函式。</p>';
+          var logicHtml = '<p style="color:#8b949e;font-size:13px">請先確認執行路徑。</p>';
+          var sqlHtml = '<p style="color:#8b949e;font-size:13px">未偵測到 SQL 語法。</p>';
+
+          if (trace && trace.steps && trace.steps.length > 0) {
+            // Build Mermaid sequence diagram
+            var mermaidCode = 'sequenceDiagram\n  autonumber\n';
+            var layers = trace.steps.map(function(s){ return s.layer; });
+            [...new Set(layers)].forEach(function(l) { mermaidCode += '  participant '+l+'\n'; });
+            for (var i = 0; i < trace.steps.length - 1; i++) {
+              var s = trace.steps[i], next = trace.steps[i+1];
+              mermaidCode += '  '+s.layer+'->>'+next.layer+': '+escHtml(s.function||'')+'\n';
+              mermaidCode += '  '+next.layer+'-->>'+s.layer+': return\n';
+            }
+
+            traceHtml = '<div id="dt-mermaid-container"><div class="mermaid">'+mermaidCode+'</div></div>';
+
+            logicHtml = '<div class="dt-steps">';
+            trace.steps.forEach(function(step, idx) {
+              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922','External':'#bc8cff'}[step.layer]||'#8b949e';
+              logicHtml += '<div class="dt-step"><div class="dt-step-num" style="background:'+layerColor+'">'+step.order+'</div>';
+              logicHtml += '<div class="dt-step-body"><div class="dt-step-layer" style="color:'+layerColor+'">'+escHtml(step.layer)+'</div>';
+              logicHtml += '<code class="dt-step-file">'+escHtml(step.file)+'</code>';
+              logicHtml += '<div class="dt-step-fn">函式: <strong>'+escHtml(step.function)+'</strong></div>';
+              if (step.description) logicHtml += '<div class="dt-step-desc">'+escHtml(step.description)+'</div>';
+              logicHtml += '</div></div>';
+            });
+            logicHtml += '</div>';
+          }
+
+          if (trace && trace.sqlQueries && trace.sqlQueries.length > 0) {
+            sqlHtml = '<div class="dt-sql-list">';
+            trace.sqlQueries.forEach(function(q) {
+              var opColor = {'SELECT':'#3fb950','INSERT':'#58a6ff','UPDATE':'#d29922','DELETE':'#f85149'}[q.operation]||'#8b949e';
+              sqlHtml += '<div class="dt-sql-item">';
+              sqlHtml += '<div class="dt-sql-header"><span class="dt-badge" style="background:'+opColor+'22;color:'+opColor+';border:1px solid '+opColor+'44">'+escHtml(q.operation)+'</span> ';
+              sqlHtml += '<strong>'+escHtml(q.name)+'</strong> <span style="color:#8b949e;font-size:11px">'+escHtml(q.sourceFile)+'</span></div>';
+              sqlHtml += '<pre class="dt-sql-code">'+escHtml(q.rawSql)+'</pre>';
+              sqlHtml += '</div>';
+            });
+            sqlHtml += '</div>';
+          }
+
+          var html = '<!DOCTYPE html><html lang="zh-TW" data-theme="dark"><head><meta charset="UTF-8"><title>'+escHtml(ep.method)+' '+escHtml(ep.path)+'</title>'
+            + '<style>'+getDtStyles()+'</style></head><body>'
+            + '<div class="dt-navbar"><span class="dt-back" onclick="window.close()">✕ 關閉</span>'
+            + '<span class="dt-method" style="background:'+methodColor+'22;color:'+methodColor+';border:1px solid '+methodColor+'44">'+escHtml(ep.method)+'</span>'
+            + '<span class="dt-path">'+escHtml(ep.path)+'</span>'
+            + (ep.tag ? '<span class="dt-tag">'+escHtml(ep.tag)+'</span>' : '')
+            + '</div>'
+            + '<div class="dt-tabs"><button class="dt-tab active" onclick="switchDtTab(this,\'dt-overview\')">概覽</button>'
+            + '<button class="dt-tab" onclick="switchDtTab(this,\'dt-trace\')">📍 執行路徑</button>'
+            + '<button class="dt-tab" onclick="switchDtTab(this,\'dt-logic\')">🔧 執行邏輯</button>'
+            + '<button class="dt-tab" onclick="switchDtTab(this,\'dt-sql\')">🗃️ SQL 語法</button>'
+            + '</div>'
+            + '<div class="dt-content">'
+            + '<div id="dt-overview" class="dt-panel">'
+            + (ep.summary ? '<p class="dt-summary">'+escHtml(ep.summary)+'</p>' : '')
+            + (ep.description ? '<p style="color:#8b949e;margin-bottom:16px">'+escHtml(ep.description)+'</p>' : '')
+            + (paramsHtml ? '<h3 class="dt-section-title">請求參數</h3>'+paramsHtml : '')
+            + (responsesHtml ? '<h3 class="dt-section-title" style="margin-top:20px">回應</h3>'+responsesHtml : '')
+            + '</div>'
+            + '<div id="dt-trace" class="dt-panel hidden">'+traceHtml+'</div>'
+            + '<div id="dt-logic" class="dt-panel hidden">'+logicHtml+'</div>'
+            + '<div id="dt-sql" class="dt-panel hidden">'+sqlHtml+'</div>'
+            + '</div>'
+            + '<script>'
+            + 'function switchDtTab(btn,panelId){'
+            + 'document.querySelectorAll(".dt-tab").forEach(function(t){t.classList.remove("active")});'
+            + 'document.querySelectorAll(".dt-panel").forEach(function(p){p.classList.add("hidden")});'
+            + 'btn.classList.add("active");'
+            + 'var panel=document.getElementById(panelId);if(panel){panel.classList.remove("hidden");}'
+            + 'if(panelId==="dt-trace"&&typeof mermaid!=="undefined"){mermaid.init(undefined,document.querySelectorAll(".mermaid"));}}'
+            + '(function(){'
+            + 'var s=document.createElement("script");'
+            + 's.src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js";'
+            + 's.onload=function(){mermaid.initialize({startOnLoad:true,theme:"dark"});};'
+            + 'document.head.appendChild(s);})();'
+            + '<\/script>'
+            + '</body></html>';
+
+          var w = window.open('', '_blank');
+          if (w) { w.document.open(); w.document.write(html); w.document.close(); }
+        }
+
+        function getDtStyles() {
+          return ':root{--bg:#0d1117;--bg2:#161b22;--card:#21262d;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;--green:#3fb950;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--mono:"SFMono-Regular",Consolas,monospace}'
+            + '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}'
+            + 'body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh}'
+            + 'code{font-family:var(--mono);font-size:12px;background:var(--card);padding:2px 6px;border-radius:4px;color:var(--blue)}'
+            + '.dt-navbar{position:sticky;top:0;z-index:10;background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 20px;display:flex;align-items:center;gap:12px}'
+            + '.dt-back{cursor:pointer;color:var(--muted);font-size:14px;padding:4px 8px;border-radius:4px;background:var(--card);border:1px solid var(--border)}'
+            + '.dt-back:hover{color:var(--text)}'
+            + '.dt-method{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:700}'
+            + '.dt-path{font-family:var(--mono);font-size:14px;font-weight:600}'
+            + '.dt-tag{padding:2px 8px;border-radius:12px;font-size:11px;background:rgba(88,166,255,.15);color:var(--blue);border:1px solid rgba(88,166,255,.3)}'
+            + '.dt-tabs{display:flex;gap:2px;padding:0 20px;background:var(--bg2);border-bottom:1px solid var(--border)}'
+            + '.dt-tab{background:none;border:none;border-bottom:2px solid transparent;padding:10px 16px;cursor:pointer;font-size:13px;color:var(--muted);margin-bottom:-1px}'
+            + '.dt-tab:hover{color:var(--text)}'
+            + '.dt-tab.active{color:var(--blue);border-bottom-color:var(--blue);font-weight:600}'
+            + '.dt-content{max-width:1200px;margin:0 auto;padding:24px 20px}'
+            + '.dt-panel.hidden{display:none}'
+            + '.dt-summary{font-size:15px;margin-bottom:12px;line-height:1.6}'
+            + '.dt-section-title{font-size:13px;font-weight:600;margin-bottom:8px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}'
+            + '.dt-table{width:100%;border-collapse:collapse;font-size:13px}'
+            + '.dt-table th{background:var(--card);padding:8px 12px;text-align:left;font-size:11px;color:var(--muted);border-bottom:1px solid var(--border);text-transform:uppercase}'
+            + '.dt-table td{padding:8px 12px;border-bottom:1px solid var(--border)}'
+            + '.dt-table tr:hover td{background:var(--card)}'
+            + '.dt-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700}'
+            + '.dt-badge-green{background:rgba(63,185,80,.15);color:#3fb950;border:1px solid rgba(63,185,80,.3)}'
+            + '.dt-badge-red{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.3)}'
+            + '.dt-steps{display:flex;flex-direction:column;gap:12px}'
+            + '.dt-step{display:flex;gap:14px;align-items:flex-start}'
+            + '.dt-step-num{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;flex-shrink:0}'
+            + '.dt-step-body{flex:1;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 16px}'
+            + '.dt-step-layer{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}'
+            + '.dt-step-file{font-size:11px;display:block;margin-bottom:4px}'
+            + '.dt-step-fn{font-size:13px;margin-bottom:2px}'
+            + '.dt-step-desc{font-size:12px;color:var(--muted)}'
+            + '.dt-sql-list{display:flex;flex-direction:column;gap:16px}'
+            + '.dt-sql-item{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}'
+            + '.dt-sql-header{padding:10px 16px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border)}'
+            + '.dt-sql-code{padding:16px;font-family:var(--mono);font-size:12px;line-height:1.7;overflow-x:auto;color:#e6edf3;white-space:pre}'
+            + '::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}'
+            + '.mermaid svg{max-width:100%}';
         }
 
         // ═══ Modal ═══

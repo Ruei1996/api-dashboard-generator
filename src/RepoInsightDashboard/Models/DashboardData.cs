@@ -8,6 +8,7 @@ public class DashboardData
     public List<PackageDependency> Packages { get; set; } = [];
     public CallGraph CallGraph { get; set; } = new();
     public List<ApiEndpoint> ApiEndpoints { get; set; } = [];
+    public List<ApiTrace> ApiTraces { get; set; } = [];
     public List<ContainerInfo> Containers { get; set; } = [];
     public DockerfileInfo? Dockerfile { get; set; }
     public List<EnvVariable> EnvVariables { get; set; } = [];
@@ -16,6 +17,7 @@ public class DashboardData
     public List<string> DesignPatterns { get; set; } = [];
     public List<SecurityRisk> SecurityRisks { get; set; } = [];
     public List<string> StartupSequence { get; set; } = [];
+    public TestSuiteInfo Tests { get; set; } = new();
 }
 
 public class MetaInfo

@@ -49,6 +49,14 @@ public class EnvFileAnalyzer
     private static bool IsEnvFile(FileNode file)
     {
         var name = file.Name.ToLowerInvariant();
+        var path = file.RelativePath.ToLowerInvariant();
+
+        // Exclude test env files: test.env, *.test.env, files in test/ directories
+        if (name == "test.env" || name.StartsWith("test.") || name.Contains(".test."))
+            return false;
+        if (path.Contains("/test/") || path.Contains("/tests/") || path.Contains("/spec/"))
+            return false;
+
         return name == ".env" || name.StartsWith(".env.") || name.EndsWith(".env");
     }
 }

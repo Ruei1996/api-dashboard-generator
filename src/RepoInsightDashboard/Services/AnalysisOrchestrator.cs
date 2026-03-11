@@ -8,16 +8,10 @@ public class AnalysisOrchestrator
 {
     private readonly bool _verbose;
 
-    public AnalysisOrchestrator(bool verbose = false)
-    {
-        _verbose = verbose;
-    }
+    public AnalysisOrchestrator(bool verbose = false) => _verbose = verbose;
 
     public async Task<DashboardData> AnalyzeAsync(
-        string repoPath,
-        string theme,
-        string? copilotToken,
-        CancellationToken ct = default)
+        string repoPath, string theme, string? copilotToken, CancellationToken ct = default)
     {
         repoPath = Path.GetFullPath(repoPath);
         Log($"[RID] 開始分析：{repoPath}");
@@ -26,7 +20,7 @@ public class AnalysisOrchestrator
         data.Meta.RepoPath = repoPath;
         data.Meta.Theme = theme;
 
-        // ── 1. Git Info ──
+        // 1. Git Info
         Log("[RID] 讀取 Git 資訊...");
         var (projectName, branch) = GetGitInfo(repoPath);
         data.Meta.ProjectName = projectName;
@@ -35,7 +29,7 @@ public class AnalysisOrchestrator
         data.Project.Branch = branch;
         data.Project.RepoPath = repoPath;
 
-        // ── 2. File Scan ──
+        // 2. File Scan
         Log("[RID] 掃描檔案...");
         var scanner = new FileScanner();
         var (fileTree, allFiles) = scanner.Scan(repoPath);
@@ -43,11 +37,11 @@ public class AnalysisOrchestrator
         data.Project.TotalFiles = allFiles.Count(f => !f.IsDirectory);
         data.Project.TotalSizeBytes = allFiles.Where(f => !f.IsDirectory).Sum(f => f.SizeBytes);
 
-        // ── 3. Language Detection ──
+        // 3. Language Detection
         Log("[RID] 識別語言...");
         data.Project.Languages = LanguageDetector.Detect(allFiles);
 
-        // ── 4. Read Copilot Instructions ──
+        // 4. Copilot Instructions
         var copilotInstructions = allFiles.FirstOrDefault(f =>
             f.RelativePath.Contains(".github/copilot-instructions.md", StringComparison.OrdinalIgnoreCase));
         if (copilotInstructions != null)
@@ -56,57 +50,73 @@ public class AnalysisOrchestrator
             Log("[RID] 已讀取 copilot-instructions.md");
         }
 
-        // ── 5. Dependency Analysis ──
+        // 5. Dependency Analysis
         Log("[RID] 分析依賴套件...");
         var depAnalyzer = new DependencyAnalyzer();
         data.Packages = depAnalyzer.Analyze(allFiles);
         data.DependencyGraph = depAnalyzer.BuildGraph(data.Packages, data.Project);
         Log($"[RID] 找到 {data.Packages.Count} 個套件");
 
-        // ── 6. Call Graph ──
+        // 6. Call Graph (simplified — layer groups)
         Log("[RID] 建立呼叫圖...");
         var callAnalyzer = new CallGraphAnalyzer();
         data.CallGraph = callAnalyzer.Analyze(allFiles);
         Log($"[RID] 呼叫圖：{data.CallGraph.Nodes.Count} 節點, {data.CallGraph.Edges.Count} 邊");
 
-        // ── 7. Docker Analysis ──
+        // 7. Docker Analysis
         Log("[RID] 分析 Docker 配置...");
         var dockerAnalyzer = new DockerAnalyzer();
         data.Containers = dockerAnalyzer.Analyze(allFiles);
         data.Dockerfile = dockerAnalyzer.AnalyzeDockerfile(allFiles);
-        Log($"[RID] 找到 {data.Containers.Count} 個容器服務");
 
-        // ── 8. Swagger/API Analysis ──
+        // Fallback: synthesize container from Dockerfile when no docker-compose
+        if (data.Containers.Count == 0 && data.Dockerfile != null)
+        {
+            data.Containers = dockerAnalyzer.SynthesizeContainersFromDockerfile(data.Dockerfile, projectName);
+            Log($"[RID] 從 Dockerfile 合成 {data.Containers.Count} 個服務");
+        }
+        else
+        {
+            Log($"[RID] 找到 {data.Containers.Count} 個容器服務");
+        }
+
+        // 8. Swagger/API Analysis
         Log("[RID] 解析 API 文件...");
         var swaggerAnalyzer = new SwaggerAnalyzer();
         data.ApiEndpoints = swaggerAnalyzer.Analyze(allFiles);
         Log($"[RID] 找到 {data.ApiEndpoints.Count} 個 API 端點");
 
-        // ── 9. Env Variables ──
+        // 9. API Trace Analysis
+        Log("[RID] 追蹤 API 執行路徑...");
+        var traceAnalyzer = new ApiTraceAnalyzer(repoPath, allFiles);
+        data.ApiTraces = traceAnalyzer.AnalyzeTraces(data.ApiEndpoints);
+        Log($"[RID] 完成 {data.ApiTraces.Count} 條 API 追蹤路徑");
+
+        // 10. Env Variables
         Log("[RID] 提取環境變數...");
         var envAnalyzer = new EnvFileAnalyzer();
         data.EnvVariables = envAnalyzer.Analyze(allFiles);
         Log($"[RID] 找到 {data.EnvVariables.Count} 個環境變數");
 
-        // ── 10. Build Startup Sequence ──
+        // 11. Test Analysis
+        Log("[RID] 分析測試檔案...");
+        var testAnalyzer = new TestAnalyzer();
+        data.Tests = testAnalyzer.Analyze(allFiles);
+        Log($"[RID] 測試：{data.Tests.TotalTestCount} 個（單元:{data.Tests.UnitTests.Sum(f => f.TestCases.Count)} 整合:{data.Tests.IntegrationTests.Sum(f => f.TestCases.Count)} 驗收:{data.Tests.AcceptanceTests.Sum(f => f.TestCases.Count)}）");
+
+        // 12. Startup Sequence
         data.StartupSequence = BuildStartupSequence(data);
 
-        // ── 11. Copilot Semantic Analysis ──
+        // 13. Copilot Semantic Analysis
         var copilot = new CopilotSemanticAnalyzer(copilotToken);
         if (copilot.IsAvailable)
-        {
             Log("[RID] 呼叫 GitHub Copilot API 進行語義分析...");
-            data.CopilotSummary = await copilot.GenerateProjectSummaryAsync(data, ct);
-            data.DesignPatterns = await copilot.DetectDesignPatternsAsync(data, ct);
-            data.SecurityRisks = await copilot.DetectSecurityRisksAsync(data, ct);
-        }
         else
-        {
             Log("[RID] Copilot token 未提供，使用本地分析...");
-            data.CopilotSummary = await copilot.GenerateProjectSummaryAsync(data, ct);
-            data.DesignPatterns = await copilot.DetectDesignPatternsAsync(data, ct);
-            data.SecurityRisks = await copilot.DetectSecurityRisksAsync(data, ct);
-        }
+
+        data.CopilotSummary = await copilot.GenerateProjectSummaryAsync(data, ct);
+        data.DesignPatterns = await copilot.DetectDesignPatternsAsync(data, ct);
+        data.SecurityRisks = await copilot.DetectSecurityRisksAsync(data, ct);
 
         Log("[RID] 分析完成！");
         return data;
@@ -116,7 +126,6 @@ public class AnalysisOrchestrator
     {
         var name = Path.GetFileName(repoPath);
         var branch = "main";
-
         try
         {
             if (Repository.IsValid(repoPath))
@@ -128,41 +137,30 @@ public class AnalysisOrchestrator
                     Log($"[RID] 最後提交：{last.MessageShort} by {last.Author.Name}");
             }
         }
-        catch { /* git info optional */ }
-
+        catch { }
         return (name, branch);
     }
 
     private List<string> BuildStartupSequence(DashboardData data)
     {
-        var sequence = new List<string>();
-        if (data.Containers.Count == 0) return sequence;
-
-        // Topological sort based on depends_on
+        if (data.Containers.Count == 0) return [];
         var visited = new HashSet<string>();
         var order = new List<string>();
 
         void Visit(string name)
         {
             if (!visited.Add(name)) return;
-            var container = data.Containers.FirstOrDefault(c => c.Name == name);
-            if (container != null)
-                foreach (var dep in container.DependsOn)
-                    Visit(dep);
+            var c = data.Containers.FirstOrDefault(x => x.Name == name);
+            if (c != null) foreach (var dep in c.DependsOn) Visit(dep);
             order.Add(name);
         }
-
-        foreach (var c in data.Containers)
-            Visit(c.Name);
-
+        foreach (var c in data.Containers) Visit(c.Name);
         return order;
     }
 
     private void Log(string message)
     {
-        if (_verbose)
-            Console.WriteLine(message);
-        else
-            Console.Write(".");
+        if (_verbose) Console.WriteLine(message);
+        else Console.Write(".");
     }
 }
