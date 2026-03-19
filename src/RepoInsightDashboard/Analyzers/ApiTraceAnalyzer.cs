@@ -575,11 +575,11 @@ public class ApiTraceAnalyzer
                     // This handles transaction wrappers that delegate to sqlc-generated functions.
                     foreach (var sqlcMethod in ExtractGoSqlcCalls(repoBody))
                         if (_sqlCache.TryGetValue(sqlcMethod, out var sqlcSql))
-                            trace.SqlQueries.Add(sqlcSql);
+                            trace.SqlQueries.Add(EnrichSqlQueryFromCallSite(sqlcSql, repoBody));
                 }
 
                 if (_sqlCache.TryGetValue(repoMethod, out var sql))
-                    trace.SqlQueries.Add(sql);
+                    trace.SqlQueries.Add(EnrichSqlQueryFromCallSite(sql, svcBody));
             }
         }
 
@@ -588,7 +588,7 @@ public class ApiTraceAnalyzer
         {
             foreach (var dbMethod in ExtractGoStoreCalls(handlerBody))
                 if (_sqlCache.TryGetValue(dbMethod, out var sql))
-                    trace.SqlQueries.Add(sql);
+                    trace.SqlQueries.Add(EnrichSqlQueryFromCallSite(sql, handlerBody));
         }
 
         return trace;
@@ -700,6 +700,88 @@ public class ApiTraceAnalyzer
             .Distinct()
             .Take(20)
             .ToList();
+    }
+
+    /// <summary>
+    /// Enriches a SQL query's ComposedSql by substituting literal (hardcoded) values
+    /// detected at the call site struct literal. For example, if the call site contains
+    /// <c>EnableDeletedAt: false</c>, replaces <c>/* enable_deleted_at */ 'enable_deleted_at_value'</c>
+    /// with <c>/* enable_deleted_at */ false</c>, making the composed SQL accurate for this call.
+    /// Runtime values (variables, function results) are left as symbolic placeholders.
+    /// </summary>
+    private static SqlQuery EnrichSqlQueryFromCallSite(SqlQuery query, string callSiteBody)
+    {
+        if (string.IsNullOrEmpty(callSiteBody) ||
+            string.IsNullOrEmpty(query.ComposedSql) ||
+            query.Parameters.Count == 0)
+            return query;
+
+        // Find the struct literal passed to this sqlc function call.
+        // Matches: FuncName(ctx, PkgName.FuncNameParams{ field: value, ... })
+        var structMatch = Regex.Match(callSiteBody,
+            $@"\b{Regex.Escape(query.Name)}\s*\([^{{]*\{{([^}}]*)\}}",
+            RegexOptions.Singleline);
+
+        if (!structMatch.Success) return query;
+
+        var structBody = structMatch.Groups[1].Value;
+        var composed = query.ComposedSql;
+        var enriched = false;
+
+        foreach (Match fm in Regex.Matches(structBody, @"(\w+)\s*:\s*([^,\n\r]+)"))
+        {
+            var goFieldValue = fm.Groups[2].Value.Trim().TrimEnd(',').Trim();
+            var literalValue = ExtractGoLiteralValue(goFieldValue);
+            if (literalValue == null) continue;
+
+            var argName = CamelToSnake(fm.Groups[1].Value.Trim());
+            var placeholder = $"/* {argName} */ '{argName}_value'";
+            if (!composed.Contains(placeholder)) continue;
+
+            composed = composed.Replace(placeholder, $"/* {argName} */ {literalValue}");
+            enriched = true;
+        }
+
+        if (!enriched) return query;
+
+        return new SqlQuery
+        {
+            Name = query.Name,
+            Operation = query.Operation,
+            RawSql = query.RawSql,
+            ComposedSql = composed,
+            SourceFile = query.SourceFile,
+            FunctionName = query.FunctionName,
+            Parameters = query.Parameters
+        };
+    }
+
+    /// <summary>
+    /// Converts a Go struct field name (CamelCase) to the snake_case name used by sqlc.arg().
+    /// Example: "DateStartedAtValidate" → "date_started_at_validate", "UserID" → "user_i_d" (no, handled below)
+    /// </summary>
+    private static string CamelToSnake(string camel)
+    {
+        var s = Regex.Replace(camel, @"(?<=[a-z0-9])([A-Z])", "_$1");
+        s = Regex.Replace(s, @"(?<=[A-Z]{1})([A-Z][a-z])", "_$1");
+        return s.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Returns a SQL-literal string if the Go expression is a compile-time constant,
+    /// or null if it is a runtime value (variable, function call, etc.).
+    /// </summary>
+    private static string? ExtractGoLiteralValue(string expr)
+    {
+        expr = expr.Trim();
+        if (expr is "true" or "false") return expr;
+        if (expr == "nil") return "NULL";
+        if (Regex.IsMatch(expr, @"^-?\d+(\.\d+)?$")) return expr;
+        var strMatch = Regex.Match(expr, @"^""([^""\\]*)""$");
+        if (strMatch.Success) return $"'{strMatch.Groups[1].Value}'";
+        var rawMatch = Regex.Match(expr, @"^`([^`]*)`$");
+        if (rawMatch.Success) return $"'{rawMatch.Groups[1].Value}'";
+        return null;
     }
 
     /// <summary>
