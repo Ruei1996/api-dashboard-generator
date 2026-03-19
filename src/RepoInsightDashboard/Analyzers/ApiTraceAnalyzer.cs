@@ -22,6 +22,10 @@ public class ApiTraceAnalyzer
     private readonly Dictionary<string, SqlQuery> _sqlCache =
         new(StringComparer.OrdinalIgnoreCase);
 
+    // (HTTP_METHOD_UPPER, normalized_path) -> handler function name
+    // Populated by scanning grpc-gateway HandlePath / gin / echo / chi route registrations.
+    private readonly Dictionary<(string Method, string Path), string> _routeHandlerIndex = new();
+
     public ApiTraceAnalyzer(string repoPath, List<FileNode> allFiles)
     {
         _repoPath = repoPath;
@@ -29,6 +33,7 @@ public class ApiTraceAnalyzer
         _primaryLanguage = DetectPrimaryLanguage();
         BuildFunctionIndex();
         PreloadSqlQueries();
+        BuildRouteHandlerIndex();
     }
 
     // ═══ Public Entry Point ══════════════════════════════════════════════════
@@ -86,7 +91,7 @@ public class ApiTraceAnalyzer
             { ".go", ".cs", ".py", ".java", ".kt", ".ts", ".js", ".php", ".rb" };
 
         foreach (var file in _allFiles.Where(f =>
-            !f.IsDirectory && srcExts.Contains(f.Extension) && !IsTestFile(f)))
+            !f.IsDirectory && srcExts.Contains(f.Extension) && !IsTestFile(f) && !IsGeneratedFile(f)))
         {
             try
             {
@@ -176,7 +181,7 @@ public class ApiTraceAnalyzer
         var srcExts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { ".go", ".cs", ".py", ".java", ".ts", ".js", ".php", ".rb" };
         foreach (var file in _allFiles.Where(f =>
-            !f.IsDirectory && srcExts.Contains(f.Extension) && !IsTestFile(f)))
+            !f.IsDirectory && srcExts.Contains(f.Extension) && !IsTestFile(f) && !IsGeneratedFile(f)))
         {
             try { ExtractInlineSqlFromFile(file); }
             catch { }
@@ -249,7 +254,82 @@ public class ApiTraceAnalyzer
         return m.Value.Trim('`', '"', '\'', '@').Trim();
     }
 
-    // ═══ SQL Composition ══════════════════════════════════════════════════════
+    // ═══ Route Handler Index (grpc-gateway / gin / echo / chi) ═══════════════
+
+    /// <summary>
+    /// Scans all Go source files for explicit route registrations:
+    ///   grpc-gateway: mux.HandlePath(http.MethodXxx, "/path", server.HandlerFunc)
+    ///   gin:          r.POST("/path", handler.Method) / router.POST("/path", fn)
+    ///   echo:         e.POST("/path", handler.Method)
+    ///   chi:          r.Post("/path", handler.Method)
+    /// Populates _routeHandlerIndex so AnalyzeGoEndpoint can resolve routes
+    /// before falling back to name-derived candidates.
+    /// </summary>
+    private void BuildRouteHandlerIndex()
+    {
+        // Method literal map: http.MethodPost → "POST", etc.
+        var methodMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "MethodGet", "GET" }, { "MethodPost", "POST" }, { "MethodPut", "PUT" },
+            { "MethodDelete", "DELETE" }, { "MethodPatch", "PATCH" },
+            { "MethodOptions", "OPTIONS" }, { "MethodHead", "HEAD" }
+        };
+
+        foreach (var file in _allFiles.Where(f =>
+            !f.IsDirectory && f.Extension == ".go" && !IsTestFile(f) && !IsGeneratedFile(f)))
+        {
+            try
+            {
+                var lines = File.ReadAllLines(file.AbsolutePath);
+                foreach (var line in lines)
+                {
+                    TryParseHandlePathRoute(line, methodMap);
+                    TryParseGinEchoChiRoute(line, methodMap);
+                }
+            }
+            catch { }
+        }
+    }
+
+    private void TryParseHandlePathRoute(string line, Dictionary<string, string> methodMap)
+    {
+        // Patterns: mux.HandlePath(http.MethodPost, "/v1/path", server.HandlerFunc)
+        //           grpcMux.HandlePath("POST", "/v1/path", server.HandlerFunc)
+        var m = Regex.Match(line,
+            @"\.HandlePath\s*\(\s*(?:http\.(\w+)|""(\w+)"")\s*,\s*""([^""]+)""\s*,\s*\w+\.(\w+)\s*\)");
+        if (!m.Success) return;
+
+        var methodRaw = m.Groups[1].Value.Length > 0 ? m.Groups[1].Value : m.Groups[2].Value;
+        var path = m.Groups[3].Value;
+        var handlerFunc = m.Groups[4].Value;
+
+        var method = methodMap.TryGetValue(methodRaw, out var mapped)
+            ? mapped
+            : methodRaw.ToUpper();
+
+        _routeHandlerIndex[(method, path)] = handlerFunc;
+    }
+
+    private void TryParseGinEchoChiRoute(string line, Dictionary<string, string> methodMap)
+    {
+        // Patterns:
+        //   r.POST("/v1/path", handler.Method)
+        //   router.GET("/v1/path", handlerFunc)
+        //   e.PUT("/v1/path", controller.Update)
+        //   r.Post("/v1/path", handler.Method)   (chi uses uppercase first letter)
+        var m = Regex.Match(line,
+            @"(?:router|r|e|g|api|v\d+|group)\.(GET|POST|PUT|DELETE|PATCH|Get|Post|Put|Delete|Patch)\s*\(\s*""([^""]+)""\s*,\s*(?:\w+\.)?(\w+)\s*[,)]");
+        if (!m.Success) return;
+
+        var method = m.Groups[1].Value.ToUpper();
+        var path = m.Groups[2].Value;
+        var handlerFunc = m.Groups[3].Value;
+
+        if (handlerFunc.Length > 1 && !IsKeyword(handlerFunc))
+            _routeHandlerIndex[(method, path)] = handlerFunc;
+    }
+
+
 
     /// <summary>
     /// Handles sqlc.arg(name) format — compose SQL by annotating each named argument.
@@ -412,8 +492,16 @@ public class ApiTraceAnalyzer
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
 
-        var candidates = DeriveGoFunctionCandidates(ep.OperationId, ep.Path, ep.Method);
-        var handlerResult = FindHandlerInFiles(candidates, IsGoSourceFile);
+        // 1. Check explicit route registrations first (HandlePath, gin/echo/chi)
+        var handlerResult = FindGoRouteHandlerFromIndex(ep.Method, ep.Path);
+
+        // 2. Fall back to name-derived candidates
+        if (handlerResult == null)
+        {
+            var candidates = DeriveGoFunctionCandidates(ep.OperationId, ep.Path, ep.Method);
+            handlerResult = FindHandlerInFiles(candidates, IsGoSourceFile);
+        }
+
         if (handlerResult == null) return trace;
 
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
@@ -429,7 +517,7 @@ public class ApiTraceAnalyzer
             Layer = ClassifyGoLayer(handlerResult.Value.File.RelativePath),
             File = handlerResult.Value.File.RelativePath,
             Function = handlerResult.Value.FuncName,
-            Description = DescribeGoHandlerLayer(handlerResult.Value.File.RelativePath),
+            Description = DescribeGoHandlerLayer(handlerResult.Value.File.RelativePath, handlerBody),
             StartLine = hStart,
             EndLine = hEnd,
             CalledFunctions = ExtractGoCalledFunctions(handlerBody)
@@ -469,7 +557,7 @@ public class ApiTraceAnalyzer
                 if (repoResult != null && !trace.Steps.Any(s => s.Function == repoMethod))
                 {
                     var repoLines = File.ReadAllLines(repoResult.Value.File.AbsolutePath);
-                    var (_, repoStart, repoEnd) = ExtractFunctionBodyWithLines(
+                    var (repoBody, repoStart, repoEnd) = ExtractFunctionBodyWithLines(
                         repoLines, repoMethod, repoResult.Value.Line);
 
                     trace.Steps.Add(new TraceStep
@@ -482,6 +570,12 @@ public class ApiTraceAnalyzer
                         StartLine = repoStart,
                         EndLine = repoEnd
                     });
+
+                    // Scan repository body for sqlc query calls (q.XxxFunc / db.XxxFunc)
+                    // This handles transaction wrappers that delegate to sqlc-generated functions.
+                    foreach (var sqlcMethod in ExtractGoSqlcCalls(repoBody))
+                        if (_sqlCache.TryGetValue(sqlcMethod, out var sqlcSql))
+                            trace.SqlQueries.Add(sqlcSql);
                 }
 
                 if (_sqlCache.TryGetValue(repoMethod, out var sql))
@@ -545,14 +639,23 @@ public class ApiTraceAnalyzer
     {
         var calls = new List<(string, string)>();
 
-        // server.DashboardService.GetXxx(  |  s.SomeService.Method(  |  d.service.Method(
+        // Pattern 1: any_receiver.SomeService.Method(  — handles server/s/d/h/svc/impl etc.
         var m1 = Regex.Matches(body,
-            @"(?:server|s|d|h)\.\s*(\w*[Ss]ervice\w*|[Ss]vc\w*)\.\s*(\w+)\s*\(");
-        foreach (Match m in m1) calls.Add((m.Groups[1].Value, m.Groups[2].Value));
+            @"\w+\.\s*(\w*[Ss]ervice\w*|\w*[Ss]vc\w*|\w*[Mm]anager\w*|\w*[Hh]andler\w*)\.\s*(\w+)\s*\(");
+        foreach (Match m in m1)
+        {
+            if (!IsKeyword(m.Groups[2].Value))
+                calls.Add((m.Groups[1].Value, m.Groups[2].Value));
+        }
 
-        // SomeService.Method(
-        var m2 = Regex.Matches(body, @"(\w+[Ss]ervice\w*)\.(\w+)\s*\(");
-        foreach (Match m in m2) calls.Add((m.Groups[1].Value, m.Groups[2].Value));
+        // Pattern 2: StandaloneServiceVar.Method(  e.g. subscriptionService.Import(
+        var m2 = Regex.Matches(body,
+            @"(?<!\.)(\w+[Ss]ervice\w*|\w+[Ss]vc\w*)\.(\w+)\s*\(");
+        foreach (Match m in m2)
+        {
+            if (!IsKeyword(m.Groups[2].Value))
+                calls.Add((m.Groups[1].Value, m.Groups[2].Value));
+        }
 
         return calls.DistinctBy(c => c.Item2).Take(8).ToList();
     }
@@ -573,6 +676,29 @@ public class ApiTraceAnalyzer
             .Where(n => !excludes.Contains(n))
             .Distinct()
             .Take(15)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Extracts sqlc query function calls from a repository/transaction body.
+    /// Matches patterns like q.Subscriptions_GetByUserID(...) or queries.Create(...)
+    /// where the receiver is a sqlc Queries object (q / queries / db / tx).
+    /// </summary>
+    private static List<string> ExtractGoSqlcCalls(string body)
+    {
+        var excludes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "QueryContext", "ExecContext", "QueryRowContext", "BeginTx", "Begin",
+            "Commit", "Rollback", "WithTx", "New", "Close"
+        };
+        // q.FunctionName(  |  queries.FunctionName(  |  tx.FunctionName(
+        var matches = Regex.Matches(body,
+            @"(?:\bq\b|\bqueries\b|\btx\b|\bqtx\b)\s*\.\s*([A-Z]\w+)\s*\(");
+        return matches.Cast<Match>()
+            .Select(m => m.Groups[1].Value)
+            .Where(n => !excludes.Contains(n))
+            .Distinct()
+            .Take(20)
             .ToList();
     }
 
@@ -598,8 +724,11 @@ public class ApiTraceAnalyzer
 
         if (depth <= 0) return;
 
-        // Find private helper method calls: d.getXxx( / s.getXxx( etc.
-        var helperCalls = Regex.Matches(body, @"\w+\s*\.\s*([a-z]\w+)\s*\(")
+        // Find receiver method calls in the same file — both lowercase (unexported)
+        // and uppercase (exported) names, since helper logic is sometimes in exported methods.
+        // We validate the name actually exists as a method in allLines to avoid chasing
+        // external package calls.
+        var helperCalls = Regex.Matches(body, @"\w+\s*\.\s*([A-Za-z]\w+)\s*\(")
             .Cast<Match>()
             .Select(m => m.Groups[1].Value)
             .Where(n => n.Length > 2 && !IsKeyword(n))
@@ -609,7 +738,7 @@ public class ApiTraceAnalyzer
         {
             if (!visited.Add(helperName)) continue;
 
-            // Find the helper method in the same file
+            // Find the helper method in the same file (receiver method pattern)
             int helperLine = -1;
             for (int i = 0; i < allLines.Length; i++)
             {
@@ -640,17 +769,57 @@ public class ApiTraceAnalyzer
         return "Handler";
     }
 
-    private static string DescribeGoHandlerLayer(string path)
+    private static string DescribeGoHandlerLayer(string path, string body = "")
     {
         if (path.Contains("/grpc/") || path.Contains("grpc_server")) return "gRPC 請求入口（HTTP → gRPC Gateway）";
         if (path.Contains("server.go") || path.Contains("_server.go")) return "gRPC 伺服器實作（請求入口）";
         if (path.Contains("handler") || path.Contains("controller")) return "HTTP 請求處理層";
-        if (path.Contains("/api/")) return "API Handler 層";
+        if (path.Contains("/api/") || path.StartsWith("api/"))
+        {
+            // Detect multipart / file upload patterns
+            if (body.Contains("ParseMultipartForm") || body.Contains("FormFile") || body.Contains("csv.NewReader"))
+                return "HTTP Handler（grpc-gateway）— 多部分表單 / CSV 檔案上傳";
+            return "HTTP Handler（grpc-gateway）";
+        }
         return "API 請求入口處理函式";
     }
 
+    /// <summary>
+    /// Resolves a route (method + path) to a handler function using the
+    /// explicitly registered route index built from HandlePath / gin / echo / chi calls.
+    /// Tries exact match first, then normalized path match.
+    /// </summary>
+    private (FileNode File, string FuncName, int Line)? FindGoRouteHandlerFromIndex(
+        string httpMethod, string apiPath)
+    {
+        var method = httpMethod.ToUpper();
+
+        // Try exact match first
+        if (_routeHandlerIndex.TryGetValue((method, apiPath), out var handlerFunc))
+            return FindHandlerInFiles([handlerFunc], IsGoSourceFile);
+
+        // Try stripping /api prefix or version prefix variants
+        var normalizedPath = Regex.Replace(apiPath, @"^/api(/devotions)?", "");
+        if (_routeHandlerIndex.TryGetValue((method, normalizedPath), out handlerFunc))
+            return FindHandlerInFiles([handlerFunc], IsGoSourceFile);
+
+        // Try fuzzy: path ends-with match (e.g. registered as /v1/path, called as /api/svc/v1/path)
+        foreach (var kv in _routeHandlerIndex)
+        {
+            if (kv.Key.Method != method) continue;
+            if (apiPath.EndsWith(kv.Key.Path, StringComparison.OrdinalIgnoreCase) ||
+                kv.Key.Path.EndsWith(apiPath, StringComparison.OrdinalIgnoreCase))
+            {
+                var result = FindHandlerInFiles([kv.Value], IsGoSourceFile);
+                if (result != null) return result;
+            }
+        }
+        return null;
+    }
+
     private static bool IsGoSourceFile(FileNode f)
-        => f.Extension == ".go" && !f.Name.EndsWith("_test.go") && !f.IsDirectory;
+        => f.Extension == ".go" && !f.Name.EndsWith("_test.go") && !f.IsDirectory
+           && !IsGeneratedFile(f);
 
     private static bool IsGoServiceFile(string path) =>
         path.Contains("/service/") || path.StartsWith("service/") ||
@@ -1659,6 +1828,44 @@ public class ApiTraceAnalyzer
         return name.EndsWith("_test.go") || name.EndsWith(".test.ts") || name.EndsWith(".spec.ts") ||
                name.EndsWith("_test.py") || name.StartsWith("test_") || name.Contains(".test.") ||
                path.Contains("/test/") || path.Contains("/tests/") || path.Contains("/spec/") || path.Contains("/__tests__/");
+    }
+
+    /// <summary>
+    /// Returns true for auto-generated source files that should NOT be treated as
+    /// handler/service/repository entry points (they contain no real business logic).
+    /// Examples: *_grpc.pb.go, *.pb.go, *.pb.gw.go, *_gen.go, *.gen.go
+    /// Also detects files that begin with the canonical Go "Code generated" comment.
+    /// </summary>
+    private static bool IsGeneratedFile(FileNode f)
+    {
+        var name = f.Name.ToLowerInvariant();
+
+        // Go protobuf / grpc-gateway generated files
+        if (name.EndsWith(".pb.go") || name.EndsWith(".pb.gw.go")) return true;
+
+        // Convention: *_gen.go, *.gen.go, generated_*.go
+        if (name.EndsWith("_gen.go") || name.Contains(".gen.go") || name.StartsWith("generated_")) return true;
+
+        // C# / Java generated files (designers, scaffolds)
+        if (name.EndsWith(".designer.cs") || name.EndsWith(".generated.cs")) return true;
+        if (name.EndsWith(".generated.java") || name.EndsWith("generated.ts")) return true;
+
+        // Peek at first few bytes to detect "// Code generated" or "// DO NOT EDIT"
+        try
+        {
+            using var reader = new StreamReader(f.AbsolutePath);
+            for (int i = 0; i < 5; i++)
+            {
+                var line = reader.ReadLine();
+                if (line == null) break;
+                if (line.Contains("Code generated") || line.Contains("DO NOT EDIT") ||
+                    line.Contains("@generated") || line.Contains("auto-generated"))
+                    return true;
+            }
+        }
+        catch { }
+
+        return false;
     }
 
     private static bool IsKeyword(string name)
