@@ -55,6 +55,39 @@ public class JsonMetadataGenerator
                     description = r.Description
                 })
             }),
+            apiTraces = data.ApiTraces.Select(t => new
+            {
+                method = t.Method,
+                path = t.Path,
+                handlerFile = t.HandlerFile,
+                handlerFunction = t.HandlerFunction,
+                steps = t.Steps.Select(s => new
+                {
+                    order = s.Order,
+                    layer = s.Layer,
+                    file = s.File,
+                    function = s.Function,
+                    description = s.Description,
+                    startLine = s.StartLine,
+                    endLine = s.EndLine,
+                    calledFunctions = s.CalledFunctions
+                }),
+                sqlQueries = t.SqlQueries.Select(q => new
+                {
+                    name = q.Name,
+                    operation = q.Operation,
+                    rawSql = q.RawSql,
+                    composedSql = q.ComposedSql,
+                    sourceFile = q.SourceFile,
+                    functionName = q.FunctionName,
+                    parameters = q.Parameters.Select(p => new
+                    {
+                        name = p.Name,
+                        type = p.Type,
+                        placeholder = p.Placeholder
+                    })
+                })
+            }),
             containers = data.Containers.Select(c => new
             {
                 name = c.Name,

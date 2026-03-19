@@ -18,8 +18,13 @@ public class HtmlDashboardGenerator
     public string Generate(DashboardData data)
     {
         var sb = new StringBuilder();
+        // Use camelCase so JS can access apiTraces, steps, sqlQueries etc. directly
         var jsonData = JsonConvert.SerializeObject(data, Formatting.None,
-            new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore });
+            new JsonSerializerSettings
+            {
+                ContractResolver = new CamelCasePropertyNamesContractResolver(),
+                NullValueHandling = NullValueHandling.Ignore
+            });
 
         sb.AppendLine("<!DOCTYPE html>");
         sb.AppendLine("<html lang=\"zh-TW\" data-theme=\"dark\">");
@@ -1416,27 +1421,76 @@ public class HtmlDashboardGenerator
 
             traceHtml = '<div id="dt-mermaid-container"><div class="mermaid">'+mermaidCode+'</div></div>';
 
-            logicHtml = '<div class="dt-steps">';
+            // Logic view — execution table
+            logicHtml = '<table class="dt-table" style="margin-bottom:24px"><thead><tr>'
+              + '<th style="width:40px">#</th><th style="width:100px">層次</th>'
+              + '<th>檔案路徑</th><th>函式名稱</th><th style="width:120px">程式碼行數</th><th>功能說明</th>'
+              + '</tr></thead><tbody>';
+            trace.steps.forEach(function(step) {
+              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922',
+                'Controller':'#58a6ff','External':'#bc8cff'}[step.layer]||'#8b949e';
+              var lineRange = (step.startLine && step.endLine)
+                ? 'L' + step.startLine + '–' + step.endLine : '—';
+              logicHtml += '<tr>';
+              logicHtml += '<td style="color:'+layerColor+';font-weight:700">'+step.order+'</td>';
+              logicHtml += '<td><span class="dt-badge" style="background:'+layerColor+'22;color:'+layerColor+';border:1px solid '+layerColor+'44">'+escHtml(step.layer)+'</span></td>';
+              logicHtml += '<td><code style="font-size:11px;word-break:break-all">'+escHtml(step.file)+'</code></td>';
+              logicHtml += '<td><strong>'+escHtml(step.function)+'</strong></td>';
+              logicHtml += '<td style="font-family:var(--mono);font-size:11px;color:#8b949e">'+escHtml(lineRange)+'</td>';
+              logicHtml += '<td style="color:#8b949e;font-size:12px">'+escHtml(step.description||'')+'</td>';
+              logicHtml += '</tr>';
+            });
+            logicHtml += '</tbody></table>';
+
+            // Append called functions summary
+            logicHtml += '<div class="dt-steps">';
             trace.steps.forEach(function(step, idx) {
-              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922','External':'#bc8cff'}[step.layer]||'#8b949e';
+              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922',
+                'Controller':'#58a6ff','External':'#bc8cff'}[step.layer]||'#8b949e';
               logicHtml += '<div class="dt-step"><div class="dt-step-num" style="background:'+layerColor+'">'+step.order+'</div>';
               logicHtml += '<div class="dt-step-body"><div class="dt-step-layer" style="color:'+layerColor+'">'+escHtml(step.layer)+'</div>';
-              logicHtml += '<code class="dt-step-file">'+escHtml(step.file)+'</code>';
+              logicHtml += '<code class="dt-step-file">'+escHtml(step.file);
+              if (step.startLine) logicHtml += ' <span style="color:#8b949e">:'+step.startLine+'–'+step.endLine+'</span>';
+              logicHtml += '</code>';
               logicHtml += '<div class="dt-step-fn">函式: <strong>'+escHtml(step.function)+'</strong></div>';
               if (step.description) logicHtml += '<div class="dt-step-desc">'+escHtml(step.description)+'</div>';
+              if (step.calledFunctions && step.calledFunctions.length > 0) {
+                logicHtml += '<div class="dt-step-desc" style="margin-top:4px">呼叫: ';
+                logicHtml += step.calledFunctions.map(function(f){ return '<code style="font-size:10px">'+escHtml(f)+'</code>'; }).join(' ');
+                logicHtml += '</div>';
+              }
               logicHtml += '</div></div>';
             });
             logicHtml += '</div>';
           }
 
           if (trace && trace.sqlQueries && trace.sqlQueries.length > 0) {
-            sqlHtml = '<div class="dt-sql-list">';
+            sqlHtml = '<p style="color:#8b949e;font-size:12px;margin-bottom:16px">共偵測到 <strong style="color:#e6edf3">'
+              + trace.sqlQueries.length + '</strong> 個 SQL 語法</p>';
+            sqlHtml += '<div class="dt-sql-list">';
             trace.sqlQueries.forEach(function(q) {
               var opColor = {'SELECT':'#3fb950','INSERT':'#58a6ff','UPDATE':'#d29922','DELETE':'#f85149'}[q.operation]||'#8b949e';
               sqlHtml += '<div class="dt-sql-item">';
               sqlHtml += '<div class="dt-sql-header"><span class="dt-badge" style="background:'+opColor+'22;color:'+opColor+';border:1px solid '+opColor+'44">'+escHtml(q.operation)+'</span> ';
-              sqlHtml += '<strong>'+escHtml(q.name)+'</strong> <span style="color:#8b949e;font-size:11px">'+escHtml(q.sourceFile)+'</span></div>';
+              sqlHtml += '<strong>'+escHtml(q.name||q.functionName)+'</strong> <span style="color:#8b949e;font-size:11px">'+escHtml(q.sourceFile)+'</span></div>';
+              // Show params table if available
+              if (q.parameters && q.parameters.length > 0) {
+                sqlHtml += '<div style="padding:10px 16px;border-bottom:1px solid var(--border)">';
+                sqlHtml += '<div style="font-size:11px;color:#8b949e;margin-bottom:6px;text-transform:uppercase">參數列表</div>';
+                sqlHtml += '<table class="dt-table"><thead><tr><th>佔位符</th><th>參數名</th><th>類型</th></tr></thead><tbody>';
+                q.parameters.forEach(function(p) {
+                  sqlHtml += '<tr><td><code>'+escHtml(p.placeholder)+'</code></td><td>'+escHtml(p.name)+'</td><td style="color:#8b949e">'+escHtml(p.type)+'</td></tr>';
+                });
+                sqlHtml += '</tbody></table></div>';
+              }
+              // Raw SQL
+              sqlHtml += '<div style="padding:8px 16px 2px;font-size:11px;color:#8b949e;text-transform:uppercase">原始 SQL</div>';
               sqlHtml += '<pre class="dt-sql-code">'+escHtml(q.rawSql)+'</pre>';
+              // Composed SQL (with param annotations)
+              if (q.composedSql && q.composedSql !== q.rawSql) {
+                sqlHtml += '<div style="padding:8px 16px 2px;font-size:11px;color:#d29922;text-transform:uppercase">組合後可執行 SQL（含參數標註）</div>';
+                sqlHtml += '<pre class="dt-sql-code" style="border-top:1px solid var(--border)">'+escHtml(q.composedSql)+'</pre>';
+              }
               sqlHtml += '</div>';
             });
             sqlHtml += '</div>';

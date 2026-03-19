@@ -17,6 +17,8 @@ public class TraceStep
     public string File { get; set; } = string.Empty;
     public string Function { get; set; } = string.Empty;
     public string? Description { get; set; }
+    public int StartLine { get; set; }
+    public int EndLine { get; set; }
     public List<string> CalledFunctions { get; set; } = [];
 }
 
@@ -25,6 +27,15 @@ public class SqlQuery
     public string Name { get; set; } = string.Empty;
     public string Operation { get; set; } = string.Empty; // SELECT, INSERT, UPDATE, DELETE
     public string RawSql { get; set; } = string.Empty;
+    public string ComposedSql { get; set; } = string.Empty;
     public string SourceFile { get; set; } = string.Empty;
-    public string GoFunctionName { get; set; } = string.Empty;
+    public string FunctionName { get; set; } = string.Empty;
+    public List<SqlParameter> Parameters { get; set; } = [];
+}
+
+public class SqlParameter
+{
+    public string Name { get; set; } = string.Empty;
+    public string Type { get; set; } = string.Empty;
+    public string Placeholder { get; set; } = string.Empty;
 }
