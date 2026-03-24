@@ -31,26 +31,3 @@ public class PackageDependency
     public string SourceFile { get; set; } = string.Empty;
     public string Ecosystem { get; set; } = string.Empty; // npm, nuget, go, maven, pip, cargo
 }
-
-public class CallGraph
-{
-    public List<CallNode> Nodes { get; set; } = [];
-    public List<CallEdge> Edges { get; set; } = [];
-}
-
-public class CallNode
-{
-    public string Id { get; set; } = string.Empty;
-    public string Name { get; set; } = string.Empty;
-    public string FilePath { get; set; } = string.Empty;
-    public int LineNumber { get; set; }
-    public string Type { get; set; } = "function"; // function, method, class
-    public string? Namespace { get; set; }
-}
-
-public class CallEdge
-{
-    public string Caller { get; set; } = string.Empty;
-    public string Callee { get; set; } = string.Empty;
-    public int LineNumber { get; set; }
-}

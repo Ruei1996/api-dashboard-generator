@@ -57,13 +57,7 @@ public class AnalysisOrchestrator
         data.DependencyGraph = depAnalyzer.BuildGraph(data.Packages, data.Project);
         Log($"[RID] 找到 {data.Packages.Count} 個套件");
 
-        // 6. Call Graph (simplified — layer groups)
-        Log("[RID] 建立呼叫圖...");
-        var callAnalyzer = new CallGraphAnalyzer();
-        data.CallGraph = callAnalyzer.Analyze(allFiles);
-        Log($"[RID] 呼叫圖：{data.CallGraph.Nodes.Count} 節點, {data.CallGraph.Edges.Count} 邊");
-
-        // 7. Docker Analysis
+        // 6. Docker Analysis
         Log("[RID] 分析 Docker 配置...");
         var dockerAnalyzer = new DockerAnalyzer();
         data.Containers = dockerAnalyzer.Analyze(allFiles);

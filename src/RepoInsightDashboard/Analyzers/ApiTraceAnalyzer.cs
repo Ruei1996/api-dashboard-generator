@@ -47,14 +47,14 @@ public class ApiTraceAnalyzer
             {
                 var trace = _primaryLanguage switch
                 {
-                    "Go"                         => AnalyzeGoEndpoint(ep),
-                    "C#"                         => AnalyzeCSharpEndpoint(ep),
-                    "Python"                     => AnalyzePythonEndpoint(ep),
-                    "Java" or "Kotlin"           => AnalyzeJavaEndpoint(ep),
+                    "Go" => AnalyzeGoEndpoint(ep),
+                    "C#" => AnalyzeCSharpEndpoint(ep),
+                    "Python" => AnalyzePythonEndpoint(ep),
+                    "Java" or "Kotlin" => AnalyzeJavaEndpoint(ep),
                     "TypeScript" or "JavaScript" => AnalyzeTypeScriptEndpoint(ep),
-                    "PHP"                        => AnalyzePhpEndpoint(ep),
-                    "Ruby"                       => AnalyzeRubyEndpoint(ep),
-                    _                            => AnalyzeGoEndpoint(ep)
+                    "PHP" => AnalyzePhpEndpoint(ep),
+                    "Ruby" => AnalyzeRubyEndpoint(ep),
+                    _ => AnalyzeGoEndpoint(ep)
                 };
                 if (trace.Steps.Count > 0 || trace.SqlQueries.Count > 0)
                     traces.Add(trace);
@@ -1379,9 +1379,12 @@ public class ApiTraceAnalyzer
     {
         var annotation = httpMethod switch
         {
-            "GET" => "GetMapping", "POST" => "PostMapping",
-            "PUT" => "PutMapping", "DELETE" => "DeleteMapping",
-            "PATCH" => "PatchMapping", _ => "RequestMapping"
+            "GET" => "GetMapping",
+            "POST" => "PostMapping",
+            "PUT" => "PutMapping",
+            "DELETE" => "DeleteMapping",
+            "PATCH" => "PatchMapping",
+            _ => "RequestMapping"
         };
         for (int i = 0; i < lines.Length - 1; i++)
         {

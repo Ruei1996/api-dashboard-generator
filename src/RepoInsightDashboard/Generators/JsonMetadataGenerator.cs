@@ -107,23 +107,6 @@ public class JsonMetadataGenerator
                 }),
                 dependsOn = c.DependsOn
             }),
-            callGraph = new
-            {
-                nodes = data.CallGraph.Nodes.Select(n => new
-                {
-                    id = n.Id,
-                    name = n.Name,
-                    filePath = n.FilePath,
-                    lineNumber = n.LineNumber,
-                    type = n.Type,
-                    @namespace = n.Namespace
-                }),
-                edges = data.CallGraph.Edges.Select(e => new
-                {
-                    caller = e.Caller,
-                    callee = e.Callee
-                })
-            },
             envVariables = data.EnvVariables.Select(e => new
             {
                 key = e.Key,

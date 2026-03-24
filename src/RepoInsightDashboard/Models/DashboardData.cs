@@ -6,8 +6,7 @@ public class DashboardData
     public ProjectInfo Project { get; set; } = new();
     public DependencyGraph DependencyGraph { get; set; } = new();
     public List<PackageDependency> Packages { get; set; } = [];
-    public CallGraph CallGraph { get; set; } = new();
-    public List<ApiEndpoint> ApiEndpoints { get; set; } = [];
+public List<ApiEndpoint> ApiEndpoints { get; set; } = [];
     public List<ApiTrace> ApiTraces { get; set; } = [];
     public List<ContainerInfo> Containers { get; set; } = [];
     public DockerfileInfo? Dockerfile { get; set; }

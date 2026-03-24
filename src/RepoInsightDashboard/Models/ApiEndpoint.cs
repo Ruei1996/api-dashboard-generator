@@ -29,7 +29,9 @@ public class ApiResponse
 {
     public string StatusCode { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
-    public string? Schema { get; set; }
+    public string? ContentType { get; set; }
+    public string? Schema { get; set; }      // top-level type (object/array/string/…)
+    public string? SchemaJson { get; set; }  // full schema serialized as JSON
 }
 
 public class ApiRequestBody

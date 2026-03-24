@@ -42,7 +42,6 @@ public class HtmlDashboardGenerator
         sb.AppendLine(BuildOverviewSection(data));
         sb.AppendLine(BuildLanguageSection(data));
         sb.AppendLine(BuildDependencySection(data));
-        sb.AppendLine(BuildCallGraphSection(data));
         sb.AppendLine(BuildApiSection(data));
         sb.AppendLine(BuildDockerSection(data));
         sb.AppendLine(BuildPortTable(data));
@@ -99,9 +98,6 @@ public class HtmlDashboardGenerator
             </a>
             <a href="#section-dependencies" class="nav-item" data-section="dependencies">
               <span class="nav-icon">📦</span> 依賴關係
-            </a>
-            <a href="#section-callgraph" class="nav-item" data-section="callgraph">
-              <span class="nav-icon">🕸️</span> 呼叫圖
             </a>
             <a href="#section-api" class="nav-item" data-section="api">
               <span class="nav-icon">🔌</span> API 端點
@@ -306,25 +302,6 @@ public class HtmlDashboardGenerator
             """;
 
         return BuildSection("dependencies", $"依賴關係圖 ({data.Packages.Count})", "📦", content);
-    }
-
-    private string BuildCallGraphSection(DashboardData data)
-    {
-        if (data.CallGraph.Nodes.Count == 0)
-            return BuildSection("callgraph", "函式呼叫圖", "🕸️", "<p class=\"text-secondary\">未偵測到函式呼叫關係。</p>", true);
-
-        var content = $"""
-            <div class="graph-toolbar">
-              <span class="graph-label">佈局</span>
-              <button class="layout-btn active" onclick="RidGraph.switchLayout('rid-call-graph','hierarchical',this)">⫶ 層次</button>
-              <button class="layout-btn" onclick="RidGraph.switchLayout('rid-call-graph','adaptive',this)">⊕ 自適應</button>
-              <button class="layout-btn-reset" onclick="RidGraph.resetZoom('rid-call-graph')" title="重置縮放">⊙</button>
-              <span class="graph-hint">顯示前 {Math.Min(data.CallGraph.Nodes.Count, 40)} 個節點 · {data.CallGraph.Edges.Count} 條邊 · 滾輪縮放 · 拖曳平移</span>
-            </div>
-            <div id="rid-call-graph" class="rid-graph-container"></div>
-            """;
-
-        return BuildSection("callgraph", $"函式呼叫圖 ({data.CallGraph.Nodes.Count} 節點)", "🕸️", content, data.CallGraph.Nodes.Count > 20);
     }
 
     private string BuildApiSection(DashboardData data)
@@ -905,9 +882,9 @@ public class HtmlDashboardGenerator
           border-bottom: 1px solid var(--border-color);
           display: flex; align-items: center; gap: 12px; padding: 0 16px;
         }
-        .navbar-brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
-        .navbar-logo { font-size: 22px; color: var(--accent-blue); }
-        .navbar-title { font-weight: 700; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
+        .navbar-brand { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .navbar-logo { font-size: 22px; color: var(--accent-blue); flex-shrink: 0; }
+        .navbar-title { font-weight: 700; font-size: 16px; white-space: nowrap; }
         .navbar-badge { background: var(--bg-hover); border: 1px solid var(--border-color); border-radius: 12px; padding: 2px 10px; font-size: 11px; color: var(--accent-green); white-space: nowrap; }
         .navbar-search { flex: 1; max-width: 400px; position: relative; }
         .navbar-search input {
@@ -1458,20 +1435,6 @@ public class HtmlDashboardGenerator
             return {nodes:nodes,edges:edges};
           }
 
-          function buildCall(data) {
-            var cg=data.callGraph||{nodes:[],edges:[]};
-            var ns=(cg.nodes||[]).slice(0,40);
-            var ids=ns.map(function(n){return n.id||n.name;});
-            return {
-              nodes:ns.map(function(n){
-                return {id:n.id||n.name,label:(n.name||'').length>22?(n.name||'').slice(0,22)+'…':(n.name||''),type:n.layer||'default'};
-              }),
-              edges:(cg.edges||[]).slice(0,60).filter(function(e){
-                return ids.indexOf(e.caller)>=0&&ids.indexOf(e.callee)>=0;
-              }).map(function(e){return{source:e.caller,target:e.callee};})
-            };
-          }
-
           function buildDocker(data) {
             var cs=data.containers||[];
             var nodes=cs.map(function(c){
@@ -1494,7 +1457,7 @@ public class HtmlDashboardGenerator
           return {
             init: function(cid, type, layout) {
               var d = window.__RID_DATA__; if (!d) return;
-              var gd = type==='dep'?buildDep(d):type==='call'?buildCall(d):type==='docker'?buildDocker(d):null;
+              var gd = type==='dep'?buildDep(d):type==='docker'?buildDocker(d):null;
               if (!gd) return;
               store[cid] = {type:type, data:gd};
               render(cid, gd, layout||'hierarchical');
@@ -1691,11 +1654,26 @@ public class HtmlDashboardGenerator
 
           var responsesHtml = '';
           if (ep.responses && ep.responses.length) {
-            responsesHtml = '<table class="dt-table"><thead><tr><th>狀態碼</th><th>說明</th></tr></thead><tbody>';
+            responsesHtml = '<div class="dt-resp-list">';
             ep.responses.forEach(function(r) {
-              responsesHtml += '<tr><td><span class="dt-badge '+(r.statusCode.startsWith('2')?'dt-badge-green':'dt-badge-red')+'">'+escHtml(r.statusCode)+'</span></td><td>'+escHtml(r.description)+'</td></tr>';
+              var is2xx = r.statusCode && r.statusCode.toString().startsWith('2');
+              var is4xx = r.statusCode && r.statusCode.toString().startsWith('4');
+              var badgeCls = is2xx ? 'dt-badge-green' : is4xx ? 'dt-badge-red' : 'dt-badge-yellow';
+              responsesHtml += '<div class="dt-resp-card">';
+              responsesHtml += '<div class="dt-resp-header">';
+              responsesHtml += '<span class="dt-badge '+badgeCls+' dt-resp-code">'+escHtml(r.statusCode)+'</span>';
+              responsesHtml += '<span class="dt-resp-desc">'+escHtml(r.description||'')+'</span>';
+              if (r.contentType) responsesHtml += '<span class="dt-resp-ct">'+escHtml(r.contentType)+'</span>';
+              responsesHtml += '</div>';
+              if (r.schemaJson) {
+                responsesHtml += '<div class="dt-resp-schema-label">Response Body Schema</div>';
+                responsesHtml += '<pre class="dt-resp-schema">'+escHtml(r.schemaJson)+'</pre>';
+              } else if (r.schema) {
+                responsesHtml += '<div class="dt-resp-schema-label">Type: <code>'+escHtml(r.schema)+'</code></div>';
+              }
+              responsesHtml += '</div>';
             });
-            responsesHtml += '</tbody></table>';
+            responsesHtml += '</div>';
           }
 
           // Build trace HTML
@@ -1882,7 +1860,16 @@ public class HtmlDashboardGenerator
             + '.dt-trace-file{display:block;font-size:11px;margin-bottom:3px;color:#8b949e}'
             + '.dt-trace-fn{display:block;font-size:13px;margin-bottom:2px}'
             + '.dt-trace-desc{font-size:11px;color:#8b949e}'
-            + '.dt-trace-arrow{font-size:16px;color:#30363d;padding:3px 0 3px 18px}';
+            + '.dt-trace-arrow{font-size:16px;color:#30363d;padding:3px 0 3px 18px}'
+            + '.dt-resp-list{display:flex;flex-direction:column;gap:12px}'
+            + '.dt-resp-card{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}'
+            + '.dt-resp-header{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border)}'
+            + '.dt-resp-code{font-size:14px;font-weight:700;padding:4px 10px;border-radius:6px}'
+            + '.dt-badge-yellow{background:rgba(210,153,34,0.15);color:#e3b341;border:1px solid rgba(210,153,34,0.3)}'
+            + '.dt-resp-desc{font-size:13px;color:var(--text)}'
+            + '.dt-resp-ct{font-size:11px;color:var(--muted);margin-left:auto;font-family:var(--mono)}'
+            + '.dt-resp-schema-label{padding:6px 14px 2px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}'
+            + '.dt-resp-schema{margin:0;padding:10px 14px;font-size:12px;background:var(--bg2);color:#c9d1d9;overflow:auto;max-height:300px;line-height:1.6;white-space:pre}';
         }
 
         // ═══ Modal ═══
@@ -1968,7 +1955,6 @@ public class HtmlDashboardGenerator
           updateSidebarActive();
           // Initialize all graphs (offline-capable pure-JS SVG renderer)
           RidGraph.init('rid-dep-graph',    'dep',    'hierarchical');
-          RidGraph.init('rid-call-graph',   'call',   'hierarchical');
           RidGraph.init('rid-docker-graph', 'docker', 'hierarchical');
           console.info('[Repo Insight Dashboard] 版本 1.0.0 — 離線模式載入完成 ✅');
         });
