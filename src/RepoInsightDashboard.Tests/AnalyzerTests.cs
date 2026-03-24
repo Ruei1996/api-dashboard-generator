@@ -208,7 +208,7 @@ public class HtmlDashboardGeneratorTests
         Assert.Contains("toggleSection", html);
         Assert.Contains("global-search", html);
         Assert.Contains("theme-toggle", html);
-        Assert.Contains("mermaid", html);
+        Assert.Contains("RidGraph", html);
         Assert.EndsWith("</html>" + Environment.NewLine, html);
     }
 

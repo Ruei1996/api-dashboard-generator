@@ -32,9 +32,13 @@ public class MetaInfo
 
 public class SecurityRisk
 {
-    public string Level { get; set; } = "info"; // info, warning, critical
+    public string Level { get; set; } = "info"; // info, warning, high, critical
+    public int Priority { get; set; } = 4;       // 1=Critical, 2=High, 3=Medium/Warning, 4=Info
+    public string Category { get; set; } = "";    // e.g. "A1-注入攻擊", "A3-敏感資料暴露"
     public string Title { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
+    public string Recommendation { get; set; } = string.Empty;
     public string? FilePath { get; set; }
     public int? LineNumber { get; set; }
+    public List<string> AffectedFiles { get; set; } = [];
 }

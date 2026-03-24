@@ -265,7 +265,6 @@ public class HtmlDashboardGenerator
         if (data.Packages.Count == 0)
             return BuildSection("dependencies", "依賴關係圖", "📦", "<p class=\"text-secondary\">未找到套件依賴。</p>");
 
-        var mermaid = BuildDependencyMermaid(data);
         var ecosystems = data.Packages.GroupBy(p => p.Ecosystem)
             .Select(g => $"<span class=\"tag tag-purple\">{HtmlEncode(g.Key)} ({g.Count()})</span>");
 
@@ -286,9 +285,14 @@ public class HtmlDashboardGenerator
             </div>
             <div class="ecosystems">{string.Join(" ", ecosystems)}</div>
             <div id="dep-graph" class="sub-panel">
-              <div class="mermaid-wrap">
-                <div class="mermaid" data-id="dep-mermaid">{HtmlEncode(mermaid)}</div>
+              <div class="graph-toolbar">
+                <span class="graph-label">佈局</span>
+                <button class="layout-btn active" onclick="RidGraph.switchLayout('rid-dep-graph','hierarchical',this)">⫶ 層次</button>
+                <button class="layout-btn" onclick="RidGraph.switchLayout('rid-dep-graph','adaptive',this)">⊕ 自適應</button>
+                <button class="layout-btn-reset" onclick="RidGraph.resetZoom('rid-dep-graph')" title="重置縮放">⊙</button>
+                <span class="graph-hint">滑鼠滾輪縮放 · 拖曳平移</span>
               </div>
+              <div id="rid-dep-graph" class="rid-graph-container"></div>
             </div>
             <div id="dep-table" class="sub-panel hidden">
               <input type="search" class="table-search" placeholder="過濾套件..." oninput="filterTable(this)" data-target="dep-pkg-table" />
@@ -304,62 +308,23 @@ public class HtmlDashboardGenerator
         return BuildSection("dependencies", $"依賴關係圖 ({data.Packages.Count})", "📦", content);
     }
 
-    private string BuildDependencyMermaid(DashboardData data)
-    {
-        var sb = new StringBuilder("graph LR\n");
-        var root = $"ROOT[\"{EscapeMermaid(data.Project.Name)}\"]";
-        sb.AppendLine($"  ROOT[\"{EscapeMermaid(data.Project.Name)}\"]");
-
-        var ecosystemGroups = data.Packages.Take(30).GroupBy(p => p.Ecosystem);
-        foreach (var grp in ecosystemGroups)
-        {
-            var grpId = $"G_{grp.Key}";
-            sb.AppendLine($"  subgraph {grpId} [\"{EscapeMermaid(grp.Key)}\"]");
-            foreach (var pkg in grp.Take(8))
-            {
-                var nodeId = $"P_{SanitizeMermaidId(pkg.Name)}";
-                sb.AppendLine($"    {nodeId}[\"{EscapeMermaid(pkg.Name)} {EscapeMermaid(pkg.Version)}\"]");
-            }
-            sb.AppendLine("  end");
-            sb.AppendLine($"  ROOT --> {grpId}");
-        }
-        return sb.ToString();
-    }
-
     private string BuildCallGraphSection(DashboardData data)
     {
         if (data.CallGraph.Nodes.Count == 0)
             return BuildSection("callgraph", "函式呼叫圖", "🕸️", "<p class=\"text-secondary\">未偵測到函式呼叫關係。</p>", true);
 
-        var mermaid = BuildCallGraphMermaid(data.CallGraph);
         var content = $"""
-            <div class="mermaid-wrap">
-              <div class="mermaid" data-id="call-mermaid">{HtmlEncode(mermaid)}</div>
+            <div class="graph-toolbar">
+              <span class="graph-label">佈局</span>
+              <button class="layout-btn active" onclick="RidGraph.switchLayout('rid-call-graph','hierarchical',this)">⫶ 層次</button>
+              <button class="layout-btn" onclick="RidGraph.switchLayout('rid-call-graph','adaptive',this)">⊕ 自適應</button>
+              <button class="layout-btn-reset" onclick="RidGraph.resetZoom('rid-call-graph')" title="重置縮放">⊙</button>
+              <span class="graph-hint">顯示前 {Math.Min(data.CallGraph.Nodes.Count, 40)} 個節點 · {data.CallGraph.Edges.Count} 條邊 · 滾輪縮放 · 拖曳平移</span>
             </div>
-            <p class="text-secondary" style="margin-top:8px;font-size:12px">
-              顯示前 {Math.Min(data.CallGraph.Nodes.Count, 30)} 個節點，{data.CallGraph.Edges.Count} 條呼叫邊。點擊節點查看詳情。
-            </p>
+            <div id="rid-call-graph" class="rid-graph-container"></div>
             """;
 
         return BuildSection("callgraph", $"函式呼叫圖 ({data.CallGraph.Nodes.Count} 節點)", "🕸️", content, data.CallGraph.Nodes.Count > 20);
-    }
-
-    private string BuildCallGraphMermaid(CallGraph cg)
-    {
-        var sb = new StringBuilder("graph TD\n");
-        foreach (var node in cg.Nodes.Take(30))
-        {
-            var id = SanitizeMermaidId(node.Id);
-            var label = EscapeMermaid(node.Name.Length > 20 ? node.Name[..20] + "…" : node.Name);
-            sb.AppendLine($"  {id}[\"{label}\"]");
-        }
-        var nodeIds = cg.Nodes.Take(30).Select(n => n.Id).ToHashSet();
-        foreach (var edge in cg.Edges.Take(50))
-        {
-            if (!nodeIds.Contains(edge.Caller) || !nodeIds.Contains(edge.Callee)) continue;
-            sb.AppendLine($"  {SanitizeMermaidId(edge.Caller)} --> {SanitizeMermaidId(edge.Callee)}");
-        }
-        return sb.ToString();
     }
 
     private string BuildApiSection(DashboardData data)
@@ -429,7 +394,6 @@ public class HtmlDashboardGenerator
         if (data.Containers.Count == 0 && data.Dockerfile == null)
             return BuildSection("docker", "Docker 架構", "🐳", "<p class=\"text-secondary\">未找到 Docker 相關設定。</p>");
 
-        var mermaid = BuildDockerMermaid(data);
         var cards = string.Join("\n", data.Containers.Select(c => $"""
             <div class="container-card" onclick="showContainerDetail({JsonConvert.SerializeObject(c, _onclickJson).Replace("\"", "&quot;")})"
                  style="cursor:pointer" title="點擊查看詳情">
@@ -457,9 +421,14 @@ public class HtmlDashboardGenerator
               <button class="sub-tab" onclick="switchTab(this,'docker-cards')">服務卡片</button>
             </div>
             <div id="docker-diagram" class="sub-panel">
-              <div class="mermaid-wrap">
-                <div class="mermaid" data-id="docker-mermaid">{HtmlEncode(mermaid)}</div>
+              <div class="graph-toolbar">
+                <span class="graph-label">佈局</span>
+                <button class="layout-btn active" onclick="RidGraph.switchLayout('rid-docker-graph','hierarchical',this)">⫶ 層次</button>
+                <button class="layout-btn" onclick="RidGraph.switchLayout('rid-docker-graph','adaptive',this)">⊕ 自適應</button>
+                <button class="layout-btn-reset" onclick="RidGraph.resetZoom('rid-docker-graph')" title="重置縮放">⊙</button>
+                <span class="graph-hint">滑鼠滾輪縮放 · 拖曳平移</span>
               </div>
+              <div id="rid-docker-graph" class="rid-graph-container"></div>
             </div>
             <div id="docker-cards" class="sub-panel hidden">
               <div class="container-grid">{cards}</div>
@@ -468,27 +437,6 @@ public class HtmlDashboardGenerator
             """;
 
         return BuildSection("docker", $"Docker 架構 ({data.Containers.Count} 服務)", "🐳", content);
-    }
-
-    private string BuildDockerMermaid(DashboardData data)
-    {
-        var sb = new StringBuilder("graph TD\n");
-        sb.AppendLine("  subgraph DOCKER [\"🐳 Docker 服務拓撲\"]");
-        foreach (var c in data.Containers)
-        {
-            var id = SanitizeMermaidId(c.Name);
-            var ports = c.Ports.Count > 0 ? $"\\n{string.Join(",", c.Ports.Take(3).Select(p => $"{p.HostPort}:{p.ContainerPort}"))}" : "";
-            sb.AppendLine($"    {id}[\"{EscapeMermaid(c.Name)}{ports}\"]");
-        }
-        sb.AppendLine("  end");
-
-        foreach (var c in data.Containers)
-        {
-            var fromId = SanitizeMermaidId(c.Name);
-            foreach (var dep in c.DependsOn)
-                sb.AppendLine($"  {SanitizeMermaidId(dep)} --> {fromId}");
-        }
-        return sb.ToString();
     }
 
     private string BuildPortTable(DashboardData data)
@@ -533,58 +481,62 @@ public class HtmlDashboardGenerator
         if (data.StartupSequence.Count == 0)
             return BuildSection("startup", "啟動流程", "🚀", "<p class=\"text-secondary\">未偵測到容器服務啟動順序。</p>", true);
 
-        var seqMermaid = BuildSequenceMermaid(data);
-        var ganttMermaid = BuildGanttMermaid(data);
+        var seqSteps = string.Join("\n", data.StartupSequence.Take(10).Select((svc, i) =>
+        {
+            var container = data.Containers.FirstOrDefault(c => c.Name == svc);
+            var ports = container?.Ports.Count > 0
+                ? string.Join(" ", container.Ports.Take(2).Select(p => $"<span class='tag tag-blue'>{p.HostPort}:{p.ContainerPort}</span>"))
+                : "";
+            var deps = container?.DependsOn.Count > 0
+                ? $"<span class='startup-deps'>依賴：{HtmlEncode(string.Join(", ", container.DependsOn))}</span>"
+                : "";
+            var arrow = i < data.StartupSequence.Count - 1 ? "<div class='startup-connector'>↓</div>" : "";
+            return $"""
+                <div class="startup-step">
+                  <div class="startup-num">{i + 1}</div>
+                  <div class="startup-body">
+                    <div class="startup-name">{HtmlEncode(svc)}</div>
+                    <div class="startup-meta">{ports} {deps}</div>
+                  </div>
+                  <div class="startup-status">✓ Ready</div>
+                </div>
+                {arrow}
+                """;
+        }));
+
+        var ganttRows = string.Join("\n", data.StartupSequence.Take(10).Select((svc, i) =>
+        {
+            var duration = 3 + (svc.Length % 5);
+            var start = data.StartupSequence.Take(i).Sum(s => 3 + (s.Length % 5) / 2);
+            var pctLeft = Math.Min(start * 5, 80);
+            var pctWidth = Math.Max(duration * 5, 10);
+            var colors = new[] { "#58a6ff", "#3fb950", "#d29922", "#bc8cff", "#f85149" };
+            var color = colors[i % colors.Length];
+            return $"""
+                <div class="gantt-row">
+                  <div class="gantt-label">{HtmlEncode(svc)}</div>
+                  <div class="gantt-bar-track">
+                    <div class="gantt-bar" style="left:{pctLeft}%;width:{Math.Min(pctWidth, 100 - pctLeft)}%;background:{color}"></div>
+                    <span class="gantt-bar-label" style="left:{pctLeft}%;color:{color}">{duration}s</span>
+                  </div>
+                </div>
+                """;
+        }));
 
         var content = $"""
             <div class="sub-tabs">
-              <button class="sub-tab active" onclick="switchTab(this,'startup-seq')">時序圖</button>
+              <button class="sub-tab active" onclick="switchTab(this,'startup-seq')">啟動時序</button>
               <button class="sub-tab" onclick="switchTab(this,'startup-gantt')">Gantt 圖</button>
             </div>
             <div id="startup-seq" class="sub-panel">
-              <div class="mermaid-wrap"><div class="mermaid">{HtmlEncode(seqMermaid)}</div></div>
+              <div class="startup-flow">{seqSteps}</div>
             </div>
             <div id="startup-gantt" class="sub-panel hidden">
-              <div class="mermaid-wrap"><div class="mermaid">{HtmlEncode(ganttMermaid)}</div></div>
+              <div class="gantt-chart">{ganttRows}</div>
             </div>
             """;
 
-        return BuildSection("startup", "啟動流程 (時序 + Gantt)", "🚀", content);
-    }
-
-    private string BuildSequenceMermaid(DashboardData data)
-    {
-        var sb = new StringBuilder("sequenceDiagram\n");
-        sb.AppendLine("  autonumber");
-        sb.AppendLine("  participant SYS as 系統");
-        foreach (var svc in data.StartupSequence.Take(8))
-            sb.AppendLine($"  participant {SanitizeMermaidId(svc)} as {EscapeMermaid(svc)}");
-
-        sb.AppendLine("  Note over SYS: 啟動初始化");
-        foreach (var svc in data.StartupSequence.Take(8))
-        {
-            sb.AppendLine($"  SYS->>{SanitizeMermaidId(svc)}: 啟動 {EscapeMermaid(svc)}");
-            sb.AppendLine($"  {SanitizeMermaidId(svc)}-->>SYS: Ready");
-        }
-        return sb.ToString();
-    }
-
-    private string BuildGanttMermaid(DashboardData data)
-    {
-        var sb = new StringBuilder("gantt\n");
-        sb.AppendLine("  title 服務啟動時序");
-        sb.AppendLine("  dateFormat  X");
-        sb.AppendLine("  axisFormat %s秒");
-        sb.AppendLine("  section 啟動階段");
-
-        var startTime = 0;
-        foreach (var svc in data.StartupSequence.Take(10))
-        {
-            var duration = 3 + (svc.Length % 5);
-            sb.AppendLine($"  {EscapeMermaid(svc)}: {startTime}, {startTime + duration}");
-            startTime += duration / 2;
-        }
-        return sb.ToString();
+        return BuildSection("startup", "啟動流程", "🚀", content);
     }
 
     private string BuildEnvSection(DashboardData data)
@@ -681,21 +633,79 @@ public class HtmlDashboardGenerator
     {
         if (data.SecurityRisks.Count == 0)
             return BuildSection("security", "安全分析", "🛡️",
-                "<div class=\"info-box success\">✅ 未偵測到明顯安全問題。</div>");
+                "<div class=\"info-box success\">✅ 靜態掃描未偵測到明顯安全問題。建議搭配 AI 分析（設定 GITHUB_COPILOT_TOKEN）進行深層審查。</div>");
 
-        var items = string.Join("\n", data.SecurityRisks.Select(r => $"""
-            <div class="risk-item risk-{HtmlEncode(r.Level)}">
-              <div class="risk-header">
-                <span class="risk-icon">{r.Level switch { "critical" => "🔴", "warning" => "🟡", _ => "🔵" }}</span>
-                <strong>{HtmlEncode(r.Title)}</strong>
-                <span class="tag {r.Level switch { "critical" => "tag-red", "warning" => "tag-orange", _ => "tag-blue" }}">{HtmlEncode(r.Level)}</span>
+        var critical = data.SecurityRisks.Count(r => r.Priority == 1);
+        var high     = data.SecurityRisks.Count(r => r.Priority == 2);
+        var medium   = data.SecurityRisks.Count(r => r.Priority == 3);
+        var info     = data.SecurityRisks.Count(r => r.Priority == 4);
+
+        var summaryBar = $"""
+            <div class="sec-summary">
+              <div class="sec-stat sec-critical"><span class="sec-count">{critical}</span><span class="sec-lbl">危急 P1</span></div>
+              <div class="sec-stat sec-high"><span class="sec-count">{high}</span><span class="sec-lbl">高危 P2</span></div>
+              <div class="sec-stat sec-medium"><span class="sec-count">{medium}</span><span class="sec-lbl">中等 P3</span></div>
+              <div class="sec-stat sec-info"><span class="sec-count">{info}</span><span class="sec-lbl">資訊 P4</span></div>
+              <div class="sec-ai-note">
+                {(data.SecurityRisks.Any(r => !string.IsNullOrEmpty(r.Recommendation))
+                    ? "✅ 包含 AI 深度分析"
+                    : "💡 提供 GITHUB_COPILOT_TOKEN 啟用 AI 深度掃描")}
               </div>
-              <p class="risk-desc">{HtmlEncode(r.Description)}</p>
-              {(r.FilePath != null ? $"<code class=\"risk-file\">{HtmlEncode(r.FilePath)}</code>" : "")}
             </div>
-            """));
+            """;
 
-        return BuildSection("security", $"安全分析 ({data.SecurityRisks.Count})", "🛡️", items);
+        var tableRows = string.Join("\n", data.SecurityRisks.Select(r =>
+        {
+            var (badgeClass, icon, label) = r.Priority switch
+            {
+                1 => ("sec-badge-critical", "🔴", "P1 危急"),
+                2 => ("sec-badge-high",     "🟠", "P2 高危"),
+                3 => ("sec-badge-medium",   "🟡", "P3 中等"),
+                _ => ("sec-badge-info",     "🔵", "P4 資訊")
+            };
+            var affectedHtml = r.AffectedFiles.Count > 0
+                ? string.Join(" ", r.AffectedFiles.Take(3).Select(f =>
+                    $"<code class='sec-file-tag'>{HtmlEncode(f)}</code>"))
+                : (r.FilePath != null ? $"<code class='sec-file-tag'>{HtmlEncode(r.FilePath)}</code>" : "");
+            var recHtml = !string.IsNullOrEmpty(r.Recommendation)
+                ? HtmlEncode(r.Recommendation)
+                : "<span class='text-secondary'>—</span>";
+
+            return $"""
+                <tr class="sec-row sec-row-{HtmlEncode(r.Level)}">
+                  <td><span class="sec-badge {badgeClass}">{icon} {label}</span></td>
+                  <td><span class="sec-category">{HtmlEncode(r.Category)}</span></td>
+                  <td><strong>{HtmlEncode(r.Title)}</strong></td>
+                  <td class="sec-desc">{HtmlEncode(r.Description)}</td>
+                  <td class="sec-files">{affectedHtml}</td>
+                  <td class="sec-rec">{recHtml}</td>
+                </tr>
+                """;
+        }));
+
+        var aiNote = data.SecurityRisks.Any(r => !string.IsNullOrEmpty(r.Recommendation))
+            ? "" : """<div class="info-box" style="margin-top:12px">💡 設定 <code>GITHUB_COPILOT_TOKEN</code> 環境變數可啟用 AI 驅動的深度程式碼安全分析，獲得每個風險的具體修復建議。</div>""";
+
+        var content = summaryBar + $"""
+            <div class="table-wrap" style="margin-top:16px">
+              <table class="sec-table">
+                <thead>
+                  <tr>
+                    <th style="width:110px">優先級</th>
+                    <th style="width:160px">類別（OWASP）</th>
+                    <th style="width:200px">問題名稱</th>
+                    <th>說明</th>
+                    <th style="width:180px">相關檔案</th>
+                    <th style="width:220px">修復建議</th>
+                  </tr>
+                </thead>
+                <tbody>{tableRows}</tbody>
+              </table>
+            </div>
+            {aiNote}
+            """;
+
+        return BuildSection("security", $"安全分析 ({data.SecurityRisks.Count} 項風險)", "🛡️", content);
     }
 
     private string BuildUnitTestSection(DashboardData data)
@@ -1070,14 +1080,66 @@ public class HtmlDashboardGenerator
         .sub-tab:hover { color: var(--text-primary); }
         .sub-tab.active { color: var(--accent-blue); border-bottom-color: var(--accent-blue); font-weight: 600; }
         .sub-panel.hidden { display: none; }
-        /* ═══ Mermaid ═══ */
-        .mermaid-wrap {
-          background: var(--bg-card); border: 1px solid var(--border-color);
-          border-radius: var(--radius); padding: 16px; overflow: auto;
-          min-height: 80px;
+        /* ═══ Graph (RidGraph) ═══ */
+        .graph-toolbar {
+          display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+          flex-wrap: wrap;
         }
-        .mermaid { font-family: var(--font-sans) !important; }
-        .mermaid svg { max-width: 100%; }
+        .graph-label { font-size: 12px; color: var(--text-secondary); font-weight: 600; }
+        .layout-btn {
+          background: var(--bg-card); border: 1px solid var(--border-color);
+          border-radius: 6px; padding: 5px 12px; cursor: pointer;
+          font-size: 12px; color: var(--text-secondary);
+          transition: all var(--transition);
+        }
+        .layout-btn:hover { border-color: var(--accent-blue); color: var(--text-primary); }
+        .layout-btn.active {
+          background: rgba(88,166,255,0.15); border-color: var(--accent-blue);
+          color: var(--accent-blue); font-weight: 600;
+        }
+        .layout-btn-reset {
+          background: none; border: 1px solid var(--border-color); border-radius: 6px;
+          padding: 5px 8px; cursor: pointer; font-size: 13px; color: var(--text-secondary);
+          transition: all var(--transition);
+        }
+        .layout-btn-reset:hover { border-color: var(--accent-orange); color: var(--accent-orange); }
+        .graph-hint { font-size: 11px; color: var(--text-secondary); margin-left: auto; }
+        .rid-graph-container {
+          background: var(--bg-card); border: 1px solid var(--border-color);
+          border-radius: var(--radius); overflow: hidden; min-height: 320px;
+          position: relative;
+        }
+        .rid-graph-container svg { display: block; cursor: grab; user-select: none; }
+        .rid-graph-container svg:active { cursor: grabbing; }
+        /* ═══ Startup Flow ═══ */
+        .startup-flow { display: flex; flex-direction: column; align-items: flex-start; padding: 8px 0; gap: 0; }
+        .startup-step {
+          display: flex; align-items: center; gap: 14px;
+          background: var(--bg-card); border: 1px solid var(--border-color);
+          border-radius: var(--radius); padding: 12px 16px; width: 100%; max-width: 600px;
+        }
+        .startup-num {
+          width: 30px; height: 30px; border-radius: 50%; background: var(--accent-blue);
+          color: #fff; display: flex; align-items: center; justify-content: center;
+          font-size: 13px; font-weight: 700; flex-shrink: 0;
+        }
+        .startup-body { flex: 1; }
+        .startup-name { font-weight: 600; font-size: 14px; }
+        .startup-meta { font-size: 11px; color: var(--text-secondary); margin-top: 3px; display: flex; gap: 6px; flex-wrap: wrap; }
+        .startup-deps { color: var(--text-secondary); }
+        .startup-status { font-size: 12px; color: var(--accent-green); }
+        .startup-connector {
+          font-size: 20px; color: var(--border-color); margin-left: 14px; padding: 2px 0;
+          line-height: 1;
+        }
+        /* ═══ Gantt ═══ */
+        .gantt-chart { display: flex; flex-direction: column; gap: 8px; padding: 8px 0; }
+        .gantt-row { display: flex; align-items: center; gap: 12px; }
+        .gantt-label { font-size: 12px; font-family: var(--font-mono); width: 140px; flex-shrink: 0; text-align: right; color: var(--text-secondary); }
+        .gantt-bar-track { flex: 1; height: 24px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; position: relative; overflow: visible; }
+        .gantt-bar { position: absolute; top: 2px; height: 20px; border-radius: 3px; opacity: 0.8; transition: opacity var(--transition); }
+        .gantt-bar:hover { opacity: 1; }
+        .gantt-bar-label { position: absolute; top: 4px; font-size: 10px; padding-left: 4px; white-space: nowrap; }
         /* ═══ Container Grid ═══ */
         .container-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
         .container-card {
@@ -1118,14 +1180,42 @@ public class HtmlDashboardGenerator
         .test-icon { color:var(--accent-green); font-size:11px; }
         .mock-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:8px; margin-top:8px; }
         .mock-card { background:var(--bg-card); border:1px solid var(--border-color); border-radius:var(--radius); padding:10px 12px; }
-        /* ═══ Risk Items ═══ */
-        .risk-item { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 8px; }
-        .risk-critical { border-left: 3px solid var(--accent-red); }
-        .risk-warning { border-left: 3px solid var(--accent-orange); }
-        .risk-info { border-left: 3px solid var(--accent-blue); }
-        .risk-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-        .risk-desc { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
-        .risk-file { font-size: 11px; color: var(--accent-orange); }
+        /* ═══ Security Table ═══ */
+        .sec-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+        .sec-stat {
+          display: flex; flex-direction: column; align-items: center;
+          padding: 10px 18px; border-radius: var(--radius);
+          border: 1px solid var(--border-color); min-width: 80px;
+        }
+        .sec-count { font-size: 24px; font-weight: 700; line-height: 1; }
+        .sec-lbl { font-size: 11px; color: var(--text-secondary); margin-top: 3px; }
+        .sec-critical { border-color: var(--accent-red); background: rgba(248,81,73,0.08); }
+        .sec-critical .sec-count { color: var(--accent-red); }
+        .sec-high { border-color: #d29922; background: rgba(210,153,34,0.08); }
+        .sec-high .sec-count { color: #d29922; }
+        .sec-medium { border-color: var(--accent-orange); background: rgba(210,153,34,0.06); }
+        .sec-medium .sec-count { color: var(--accent-orange); }
+        .sec-info { border-color: var(--accent-blue); background: rgba(88,166,255,0.06); }
+        .sec-info .sec-count { color: var(--accent-blue); }
+        .sec-ai-note { font-size: 12px; color: var(--text-secondary); margin-left: auto; padding: 6px 12px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); }
+        .sec-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .sec-table th { background: var(--bg-card); padding: 8px 12px; text-align: left; font-size: 11px; color: var(--text-secondary); border-bottom: 1px solid var(--border-color); text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+        .sec-table td { padding: 10px 12px; border-bottom: 1px solid var(--border-color); vertical-align: top; }
+        .sec-row:hover td { background: var(--bg-hover); }
+        .sec-row-critical { border-left: 3px solid var(--accent-red); }
+        .sec-row-high { border-left: 3px solid #d29922; }
+        .sec-row-warning { border-left: 3px solid var(--accent-orange); }
+        .sec-row-info { border-left: 3px solid var(--accent-blue); }
+        .sec-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+        .sec-badge-critical { background: rgba(248,81,73,0.15); color: var(--accent-red); border: 1px solid rgba(248,81,73,0.3); }
+        .sec-badge-high { background: rgba(210,153,34,0.15); color: #e3b341; border: 1px solid rgba(210,153,34,0.3); }
+        .sec-badge-medium { background: rgba(210,153,34,0.1); color: var(--accent-orange); border: 1px solid rgba(210,153,34,0.25); }
+        .sec-badge-info { background: rgba(88,166,255,0.1); color: var(--accent-blue); border: 1px solid rgba(88,166,255,0.25); }
+        .sec-category { font-size: 11px; color: var(--text-secondary); }
+        .sec-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+        .sec-rec { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+        .sec-files { font-size: 11px; }
+        .sec-file-tag { font-size: 10px; color: var(--accent-orange); display: inline-block; margin: 1px 2px; }
         /* ═══ Modal ═══ */
         .modal-overlay {
           display: none; position: fixed; inset: 0; z-index: 200;
@@ -1165,46 +1255,262 @@ public class HtmlDashboardGenerator
 
     private string GetInlineScripts() => """
         <script>
-        // ═══ Mermaid CDN inline (minimal) ═══
-        // Load Mermaid from CDN with fallback to inline rendering
-        (function() {
-          var script = document.createElement('script');
-          script.src = 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js';
-          script.onload = function() {
-            mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'loose',
-              themeVariables: { primaryColor: '#21262d', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
-                lineColor: '#58a6ff', background: '#0d1117', nodeBorder: '#30363d' }
-            });
-            renderMermaidDiagrams();
+        // ════════════════════════════════════════════════════════════════════
+        // RidGraph — Pure-JS Offline SVG Interactive Graph Renderer v1.0
+        // Supports: Hierarchical (layered) + Adaptive (force-directed) layouts
+        // No external dependencies — fully self-contained
+        // ════════════════════════════════════════════════════════════════════
+        var RidGraph = (function() {
+          var NW = 160, NH = 44, HG = 200, VG = 100;
+          var THEME = {
+            root:       { fill: '#0d2140', stroke: '#58a6ff', text: '#79b8ff' },
+            group:      { fill: '#0d2a15', stroke: '#3fb950', text: '#56d364' },
+            leaf:       { fill: '#21262d', stroke: '#30363d', text: '#c9d1d9' },
+            service:    { fill: '#1a2433', stroke: '#58a6ff', text: '#c9d1d9' },
+            database:   { fill: '#1a2a1a', stroke: '#3fb950', text: '#56d364' },
+            Handler:    { fill: '#0d2140', stroke: '#58a6ff', text: '#79b8ff' },
+            Service:    { fill: '#0d2a15', stroke: '#3fb950', text: '#56d364' },
+            Repository: { fill: '#2a1e0d', stroke: '#d29922', text: '#e3b341' },
+            Controller: { fill: '#0d2140', stroke: '#58a6ff', text: '#79b8ff' },
+            default:    { fill: '#21262d', stroke: '#8b949e', text: '#c9d1d9' }
           };
-          script.onerror = function() { showMermaidFallback(); };
-          document.head.appendChild(script);
-        })();
+          function col(type) { return THEME[type] || THEME.default; }
 
-        function renderMermaidDiagrams() {
-          document.querySelectorAll('.mermaid').forEach(function(el) {
-            var code = el.textContent.trim();
-            if (!code) return;
-            var id = 'mermaid_' + Math.random().toString(36).substr(2,9);
-            try {
-              mermaid.render(id, code).then(function(res) {
-                el.innerHTML = res.svg;
-                el.querySelectorAll('[id]').forEach(function(n) {
-                  if (n.tagName !== 'SVG') n.style.cursor = 'pointer';
-                  n.addEventListener('click', function(e) { handleNodeClick(e, n); });
-                });
-              }).catch(function(err) {
-                el.innerHTML = '<pre style="color:var(--accent-orange);font-size:11px">⚠ 圖表渲染失敗\\n' + code.substring(0,200) + '</pre>';
+          // ── Hierarchical layout (top-down layered) ──────────────────────
+          function hierLayout(nodes, edges) {
+            if (!nodes.length) return {};
+            var out = {}, inDeg = {};
+            nodes.forEach(function(n) { out[n.id] = []; inDeg[n.id] = 0; });
+            edges.forEach(function(e) {
+              if (out[e.source] !== undefined) out[e.source].push(e.target);
+              if (inDeg[e.target] !== undefined) inDeg[e.target]++;
+            });
+            var layer = {}, queue = [], vis = {};
+            nodes.forEach(function(n) { if (!inDeg[n.id]) { queue.push(n.id); layer[n.id] = 0; vis[n.id] = 1; } });
+            if (!queue.length) { queue.push(nodes[0].id); layer[nodes[0].id] = 0; vis[nodes[0].id] = 1; }
+            var qi = 0;
+            while (qi < queue.length) {
+              var id = queue[qi++];
+              out[id].forEach(function(tid) {
+                layer[tid] = Math.max(layer[tid] || 0, (layer[id] || 0) + 1);
+                if (!vis[tid]) { vis[tid] = 1; queue.push(tid); }
               });
-            } catch(e) {}
-          });
-        }
+            }
+            nodes.forEach(function(n) { if (layer[n.id] === undefined) layer[n.id] = 0; });
+            var byL = {};
+            nodes.forEach(function(n) { var l = layer[n.id]; (byL[l] = byL[l] || []).push(n.id); });
+            var pos = {};
+            Object.keys(byL).forEach(function(l) {
+              var ids = byL[l];
+              ids.forEach(function(id, i) {
+                pos[id] = { x: (i - (ids.length - 1) / 2) * (NW + HG), y: parseInt(l) * (NH + VG) };
+              });
+            });
+            return pos;
+          }
 
-        function showMermaidFallback() {
-          document.querySelectorAll('.mermaid').forEach(function(el) {
-            el.innerHTML = '<pre style="font-size:11px;color:var(--text-secondary);overflow:auto">' + el.textContent.trim() + '</pre>';
-          });
-        }
+          // ── Force-directed (adaptive) layout ───────────────────────────
+          function forceLayout(nodes, edges) {
+            if (!nodes.length) return {};
+            var n = nodes.length;
+            var k = Math.sqrt(Math.max(n * NW * 5, 500 * 400) / n) * 1.5;
+            var pos = {};
+            nodes.forEach(function(node, i) {
+              var a = (2 * Math.PI * i) / n, r = Math.max(n * 55, 180);
+              pos[node.id] = { x: Math.cos(a) * r, y: Math.sin(a) * r, vx: 0, vy: 0 };
+            });
+            for (var iter = 0; iter < 300; iter++) {
+              var t = k * Math.max(0.04, 1.0 - iter / 250);
+              nodes.forEach(function(n2) { pos[n2.id].vx = 0; pos[n2.id].vy = 0; });
+              for (var i = 0; i < nodes.length; i++) {
+                for (var j = i + 1; j < nodes.length; j++) {
+                  var pi = pos[nodes[i].id], pj = pos[nodes[j].id];
+                  var dx = pi.x - pj.x, dy = pi.y - pj.y;
+                  var d = Math.max(Math.sqrt(dx*dx+dy*dy), 1), f = k*k/d;
+                  pi.vx += f*dx/d; pi.vy += f*dy/d;
+                  pj.vx -= f*dx/d; pj.vy -= f*dy/d;
+                }
+              }
+              edges.forEach(function(e) {
+                var ps = pos[e.source], pt = pos[e.target];
+                if (!ps || !pt) return;
+                var dx = pt.x-ps.x, dy = pt.y-ps.y;
+                var d = Math.max(Math.sqrt(dx*dx+dy*dy), 1), f = d*d/k;
+                ps.vx += f*dx/d; ps.vy += f*dy/d;
+                pt.vx -= f*dx/d; pt.vy -= f*dy/d;
+              });
+              nodes.forEach(function(n2) {
+                var p = pos[n2.id], sp = Math.sqrt(p.vx*p.vx+p.vy*p.vy);
+                if (sp > 0) { var mv = Math.min(sp, t); p.x += p.vx/sp*mv; p.y += p.vy/sp*mv; }
+              });
+            }
+            return pos;
+          }
+
+          // ── SVG render ─────────────────────────────────────────────────
+          function render(cid, gdata, layout) {
+            var container = document.getElementById(cid);
+            if (!container) return;
+            var nodes = gdata.nodes || [], edges = gdata.edges || [];
+            if (!nodes.length) {
+              container.innerHTML = '<p style="color:#8b949e;padding:32px;text-align:center;font-size:13px">無圖形資料</p>';
+              return;
+            }
+            var pos = layout === 'adaptive' ? forceLayout(nodes, edges) : hierLayout(nodes, edges);
+            var pad = 50, minX=1e9, minY=1e9, maxX=-1e9, maxY=-1e9;
+            nodes.forEach(function(n) {
+              var p = pos[n.id] || {x:0,y:0};
+              minX=Math.min(minX,p.x-NW/2); minY=Math.min(minY,p.y-NH/2);
+              maxX=Math.max(maxX,p.x+NW/2); maxY=Math.max(maxY,p.y+NH/2);
+            });
+            var vw = Math.max(maxX-minX+pad*2, 500), vh = Math.max(maxY-minY+pad*2, 280);
+            var ox = -minX+pad, oy = -minY+pad;
+            var p = ['<defs>',
+              '<marker id="rarr_'+cid+'" markerWidth="8" markerHeight="7" refX="7" refY="3.5" orient="auto">',
+              '<path d="M0,0 L0,7 L8,3.5z" fill="#58a6ff" opacity="0.75"/></marker>',
+              '<filter id="rshadow_'+cid+'" x="-20%" y="-20%" width="140%" height="140%">',
+              '<feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.35"/></filter>',
+              '</defs><g class="rid-edges">'];
+            edges.forEach(function(e) {
+              var ps = pos[e.source], pt = pos[e.target]; if (!ps||!pt) return;
+              var x1=ps.x+ox, y1=ps.y+oy, x2=pt.x+ox, y2=pt.y+oy;
+              var dx=x2-x1, dy=y2-y1, d=Math.max(Math.sqrt(dx*dx+dy*dy),1);
+              var sx=x1+dx/d*(NW/2), sy=y1+dy/d*(NH/2);
+              var ex=x2-dx/d*(NW/2+9), ey=y2-dy/d*(NH/2+9);
+              var mx=(sx+ex)/2;
+              p.push('<path d="M'+sx.toFixed(1)+','+sy.toFixed(1)+' C'+mx.toFixed(1)+','+sy.toFixed(1)+' '+mx.toFixed(1)+','+ey.toFixed(1)+' '+ex.toFixed(1)+','+ey.toFixed(1)+'"'+
+                ' fill="none" stroke="#58a6ff" stroke-width="1.5" opacity="0.4" marker-end="url(#rarr_'+cid+')"/>');
+            });
+            p.push('</g><g class="rid-nodes">');
+            nodes.forEach(function(n) {
+              var np = pos[n.id]||{x:0,y:0}, nx=np.x+ox-NW/2, ny=np.y+oy-NH/2;
+              var c = col(n.type), lines = (n.label||n.id||'').split('\n');
+              p.push('<g class="rid-node" data-nid="'+escA(n.id)+'" filter="url(#rshadow_'+cid+')">');
+              p.push('<rect x="'+nx.toFixed(1)+'" y="'+ny.toFixed(1)+'" width="'+NW+'" height="'+NH+'" rx="8"'+
+                ' fill="'+c.fill+'" stroke="'+c.stroke+'" stroke-width="1.5" class="rid-node-rect"/>');
+              var ty = ny + (lines.length > 1 ? NH/2-8 : NH/2+5);
+              lines.forEach(function(line, li) {
+                p.push('<text x="'+(nx+NW/2).toFixed(1)+'" y="'+(ty+li*16).toFixed(1)+'"'+
+                  ' text-anchor="middle" fill="'+c.text+'" font-size="'+(li===0?12:10)+'"'+
+                  ' font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif"'+
+                  ' font-weight="'+(li===0?'600':'400')+'">'+escS(line)+'</text>');
+              });
+              p.push('</g>');
+            });
+            p.push('</g>');
+            container.innerHTML = '<svg id="'+cid+'_svg" viewBox="0 0 '+vw.toFixed(0)+' '+vh.toFixed(0)+'"'+
+              ' style="width:100%;min-height:300px;background:var(--bg-secondary);display:block"'+
+              ' xmlns="http://www.w3.org/2000/svg">'+p.join('')+'</svg>';
+            addInteraction(container.querySelector('svg'));
+          }
+
+          function addInteraction(svg) {
+            if (!svg) return;
+            var st = {pan:false,sx:0,sy:0,tx:0,ty:0,sc:1};
+            var wrap = document.createElementNS('http://www.w3.org/2000/svg','g');
+            wrap.setAttribute('class','rid-wrap');
+            Array.from(svg.childNodes).forEach(function(c) { if (c.tagName !== 'defs') wrap.appendChild(c); });
+            svg.appendChild(wrap);
+            function applyT() { wrap.setAttribute('transform','translate('+st.tx+','+st.ty+') scale('+st.sc+')'); }
+            svg.addEventListener('mousedown', function(e) {
+              st.pan=true; st.sx=e.clientX-st.tx; st.sy=e.clientY-st.ty;
+              svg.style.cursor='grabbing'; e.preventDefault();
+            });
+            document.addEventListener('mousemove', function(e) {
+              if (!st.pan) return; st.tx=e.clientX-st.sx; st.ty=e.clientY-st.sy; applyT();
+            });
+            document.addEventListener('mouseup', function() { st.pan=false; svg.style.cursor='grab'; });
+            svg.addEventListener('wheel', function(e) {
+              e.preventDefault();
+              var r=svg.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top;
+              var d=e.deltaY<0?1.12:0.9, ns=Math.max(0.1,Math.min(6,st.sc*d));
+              st.tx=mx-(mx-st.tx)*(ns/st.sc); st.ty=my-(my-st.ty)*(ns/st.sc); st.sc=ns; applyT();
+            },{passive:false});
+            svg.addEventListener('dblclick', function() { st.tx=0;st.ty=0;st.sc=1; applyT(); });
+            svg.addEventListener('mouseover', function(e) {
+              var nd=e.target.closest('.rid-node');
+              if (nd) { var rc=nd.querySelector('rect'); if(rc){rc.style.strokeWidth='2.5';rc.style.filter='brightness(1.2)';} }
+            });
+            svg.addEventListener('mouseout', function(e) {
+              var nd=e.target.closest('.rid-node');
+              if (nd) { var rc=nd.querySelector('rect'); if(rc){rc.style.strokeWidth='1.5';rc.style.filter='';} }
+            });
+          }
+
+          function escA(s) { return String(s||'').replace(/[<>"&]/g,function(c){return{'<':'&lt;','>':'&gt;','"':'&quot;','&':'&amp;'}[c];}); }
+          function escS(s) { return String(s||'').replace(/[<>&]/g,function(c){return{'<':'&lt;','>':'&gt;','&':'&amp;'}[c];}); }
+
+          // ── Data builders ───────────────────────────────────────────────
+          function buildDep(data) {
+            var nodes=[{id:'ROOT',label:(data.project&&data.project.name)||'Project',type:'root'}], edges=[];
+            var pkgs=data.packages||[], ecos=[];
+            pkgs.forEach(function(p){if(ecos.indexOf(p.ecosystem)<0)ecos.push(p.ecosystem);});
+            ecos.forEach(function(eco){
+              var gid='G_'+eco.replace(/[^a-zA-Z0-9]/g,'_');
+              nodes.push({id:gid,label:eco,type:'group'});
+              edges.push({source:'ROOT',target:gid});
+              pkgs.filter(function(p){return p.ecosystem===eco;}).slice(0,8).forEach(function(pkg){
+                var pid='P_'+Math.abs(hashStr(pkg.name+pkg.version));
+                nodes.push({id:pid,label:(pkg.name||'')+(pkg.version?'\n'+pkg.version:''),type:'leaf'});
+                edges.push({source:gid,target:pid});
+              });
+            });
+            return {nodes:nodes,edges:edges};
+          }
+
+          function buildCall(data) {
+            var cg=data.callGraph||{nodes:[],edges:[]};
+            var ns=(cg.nodes||[]).slice(0,40);
+            var ids=ns.map(function(n){return n.id||n.name;});
+            return {
+              nodes:ns.map(function(n){
+                return {id:n.id||n.name,label:(n.name||'').length>22?(n.name||'').slice(0,22)+'…':(n.name||''),type:n.layer||'default'};
+              }),
+              edges:(cg.edges||[]).slice(0,60).filter(function(e){
+                return ids.indexOf(e.caller)>=0&&ids.indexOf(e.callee)>=0;
+              }).map(function(e){return{source:e.caller,target:e.callee};})
+            };
+          }
+
+          function buildDocker(data) {
+            var cs=data.containers||[];
+            var nodes=cs.map(function(c){
+              var isDB=/postgres|mysql|mongo|redis|rabbit|kafka|elastic|memcache/i.test(c.image||'');
+              var ps=(c.ports||[]).slice(0,2).map(function(p){return p.hostPort+':'+p.containerPort;}).join(',');
+              return {id:c.name,label:c.name+(ps?'\n'+ps:''),type:isDB?'database':'service'};
+            });
+            var edges=[];
+            cs.forEach(function(c){(c.dependsOn||[]).forEach(function(dep){edges.push({source:dep,target:c.name});});});
+            return {nodes:nodes,edges:edges};
+          }
+
+          function hashStr(s) {
+            var h=5381; for(var i=0;i<s.length;i++)h=((h<<5)+h)+s.charCodeAt(i); return h>>>0;
+          }
+
+          // ── Registry ────────────────────────────────────────────────────
+          var store = {};
+
+          return {
+            init: function(cid, type, layout) {
+              var d = window.__RID_DATA__; if (!d) return;
+              var gd = type==='dep'?buildDep(d):type==='call'?buildCall(d):type==='docker'?buildDocker(d):null;
+              if (!gd) return;
+              store[cid] = {type:type, data:gd};
+              render(cid, gd, layout||'hierarchical');
+            },
+            switchLayout: function(cid, layout, btn) {
+              var tb = btn.closest ? btn.closest('.graph-toolbar') : null;
+              if (tb) tb.querySelectorAll('.layout-btn').forEach(function(b){b.classList.remove('active');});
+              btn.classList.add('active');
+              var g = store[cid]; if (g) render(cid, g.data, layout);
+            },
+            resetZoom: function(cid) {
+              var svg = document.getElementById(cid+'_svg');
+              if (svg) { var w=svg.querySelector('.rid-wrap'); if(w) w.setAttribute('transform','translate(0,0) scale(1)'); }
+            }
+          };
+        })();
 
         // ═══ Sidebar Toggle ═══
         var sidebarOpen = true;
@@ -1222,11 +1528,6 @@ public class HtmlDashboardGenerator
           isDark = !isDark;
           document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
           this.textContent = isDark ? '🌙' : '☀️';
-          // Re-render mermaid for theme change
-          if (typeof mermaid !== 'undefined') {
-            mermaid.initialize({ startOnLoad: false, theme: isDark ? 'dark' : 'default' });
-            renderMermaidDiagrams();
-          }
         });
 
         // ═══ Section Collapse ═══
@@ -1292,12 +1593,6 @@ public class HtmlDashboardGenerator
           var panel = document.getElementById(panelId);
           if (panel) {
             panel.classList.remove('hidden');
-            // Render mermaid if present
-            if (typeof mermaid !== 'undefined') {
-              panel.querySelectorAll('.mermaid').forEach(function(el) {
-                if (!el.querySelector('svg')) renderMermaidDiagrams();
-              });
-            }
           }
         }
 
@@ -1409,17 +1704,24 @@ public class HtmlDashboardGenerator
           var sqlHtml = '<p style="color:#8b949e;font-size:13px">未偵測到 SQL 語法。</p>';
 
           if (trace && trace.steps && trace.steps.length > 0) {
-            // Build Mermaid sequence diagram
-            var mermaidCode = 'sequenceDiagram\n  autonumber\n';
-            var layers = trace.steps.map(function(s){ return s.layer; });
-            [...new Set(layers)].forEach(function(l) { mermaidCode += '  participant '+l+'\n'; });
-            for (var i = 0; i < trace.steps.length - 1; i++) {
-              var s = trace.steps[i], next = trace.steps[i+1];
-              mermaidCode += '  '+s.layer+'->>'+next.layer+': '+escHtml(s.function||'')+'\n';
-              mermaidCode += '  '+next.layer+'-->>'+s.layer+': return\n';
-            }
-
-            traceHtml = '<div id="dt-mermaid-container"><div class="mermaid">'+mermaidCode+'</div></div>';
+            // Build HTML flow diagram for execution trace
+            traceHtml = '<div class="dt-trace-flow">';
+            trace.steps.forEach(function(step, i) {
+              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922',
+                'Controller':'#58a6ff','External':'#bc8cff'}[step.layer]||'#8b949e';
+              traceHtml += '<div class="dt-trace-item">';
+              traceHtml += '<div class="dt-trace-badge" style="background:'+layerColor+'22;border:1px solid '+layerColor+'44;color:'+layerColor+'">'+escHtml(step.layer)+'</div>';
+              traceHtml += '<div class="dt-trace-body">';
+              traceHtml += '<div class="dt-trace-num" style="color:'+layerColor+'">'+step.order+'</div>';
+              traceHtml += '<div class="dt-trace-content">';
+              traceHtml += '<code class="dt-trace-file">'+escHtml(step.file||'')+'</code>';
+              traceHtml += '<strong class="dt-trace-fn">'+escHtml(step.function||'')+'</strong>';
+              if (step.description) traceHtml += '<div class="dt-trace-desc">'+escHtml(step.description)+'</div>';
+              traceHtml += '</div></div>';
+              if (i < trace.steps.length - 1) traceHtml += '<div class="dt-trace-arrow">↓</div>';
+              traceHtml += '</div>';
+            });
+            traceHtml += '</div>';
 
             // Logic view — execution table
             logicHtml = '<table class="dt-table" style="margin-bottom:24px"><thead><tr>'
@@ -1524,13 +1826,7 @@ public class HtmlDashboardGenerator
             + 'document.querySelectorAll(".dt-tab").forEach(function(t){t.classList.remove("active")});'
             + 'document.querySelectorAll(".dt-panel").forEach(function(p){p.classList.add("hidden")});'
             + 'btn.classList.add("active");'
-            + 'var panel=document.getElementById(panelId);if(panel){panel.classList.remove("hidden");}'
-            + 'if(panelId==="dt-trace"&&typeof mermaid!=="undefined"){mermaid.init(undefined,document.querySelectorAll(".mermaid"));}}'
-            + '(function(){'
-            + 'var s=document.createElement("script");'
-            + 's.src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js";'
-            + 's.onload=function(){mermaid.initialize({startOnLoad:true,theme:"dark"});};'
-            + 'document.head.appendChild(s);})();'
+            + 'var panel=document.getElementById(panelId);if(panel){panel.classList.remove("hidden");}}'
             + '<\/script>'
             + '</body></html>';
 
@@ -1577,7 +1873,16 @@ public class HtmlDashboardGenerator
             + '.dt-sql-header{padding:10px 16px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border)}'
             + '.dt-sql-code{padding:16px;font-family:var(--mono);font-size:12px;line-height:1.7;overflow-x:auto;color:#e6edf3;white-space:pre}'
             + '::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}'
-            + '.mermaid svg{max-width:100%}';
+            + '.dt-trace-flow{display:flex;flex-direction:column;gap:0;padding:8px 0}'
+            + '.dt-trace-item{display:flex;flex-direction:column;align-items:flex-start}'
+            + '.dt-trace-body{display:flex;align-items:flex-start;gap:12px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;width:100%;max-width:640px}'
+            + '.dt-trace-num{font-size:18px;font-weight:700;min-width:24px;text-align:center}'
+            + '.dt-trace-badge{font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;margin-bottom:6px;display:inline-block}'
+            + '.dt-trace-content{flex:1}'
+            + '.dt-trace-file{display:block;font-size:11px;margin-bottom:3px;color:#8b949e}'
+            + '.dt-trace-fn{display:block;font-size:13px;margin-bottom:2px}'
+            + '.dt-trace-desc{font-size:11px;color:#8b949e}'
+            + '.dt-trace-arrow{font-size:16px;color:#30363d;padding:3px 0 3px 18px}';
         }
 
         // ═══ Modal ═══
@@ -1629,14 +1934,6 @@ public class HtmlDashboardGenerator
           openModal();
         }
 
-        function handleNodeClick(e, node) {
-          var label = node.textContent || node.getAttribute('aria-label') || '';
-          if (!label.trim()) return;
-          document.getElementById('modal-title').textContent = '節點詳情';
-          document.getElementById('modal-body').innerHTML = '<p><strong>' + escHtml(label.trim()) + '</strong></p>';
-          openModal();
-        }
-
         function openModal() {
           var overlay = document.getElementById('detail-modal');
           overlay.classList.add('active');
@@ -1669,7 +1966,11 @@ public class HtmlDashboardGenerator
         // ═══ Init ═══
         document.addEventListener('DOMContentLoaded', function() {
           updateSidebarActive();
-          console.info('[Repo Insight Dashboard] 版本 1.0.0 — 載入完成 ✅');
+          // Initialize all graphs (offline-capable pure-JS SVG renderer)
+          RidGraph.init('rid-dep-graph',    'dep',    'hierarchical');
+          RidGraph.init('rid-call-graph',   'call',   'hierarchical');
+          RidGraph.init('rid-docker-graph', 'docker', 'hierarchical');
+          console.info('[Repo Insight Dashboard] 版本 1.0.0 — 離線模式載入完成 ✅');
         });
         </script>
         """;

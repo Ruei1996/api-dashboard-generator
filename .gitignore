@@ -420,4 +420,7 @@ FodyWeavers.xsd
 # JetBrains Rider
 *.sln.iml
 
+# Claude AI files
+.claude
+
 # End of https://www.toptal.com/developers/gitignore/api/csharp

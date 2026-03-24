@@ -116,7 +116,7 @@ public class AnalysisOrchestrator
 
         data.CopilotSummary = await copilot.GenerateProjectSummaryAsync(data, ct);
         data.DesignPatterns = await copilot.DetectDesignPatternsAsync(data, ct);
-        data.SecurityRisks = await copilot.DetectSecurityRisksAsync(data, ct);
+        data.SecurityRisks = await copilot.DetectSecurityRisksAsync(data, allFiles, repoPath, ct);
 
         Log("[RID] 分析完成！");
         return data;
