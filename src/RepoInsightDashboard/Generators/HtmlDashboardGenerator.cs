@@ -18,13 +18,48 @@ public class HtmlDashboardGenerator
     public string Generate(DashboardData data)
     {
         var sb = new StringBuilder();
-        // Use camelCase so JS can access apiTraces, steps, sqlQueries etc. directly
-        var jsonData = JsonConvert.SerializeObject(data, Formatting.None,
-            new JsonSerializerSettings
-            {
-                ContractResolver = new CamelCasePropertyNamesContractResolver(),
-                NullValueHandling = NullValueHandling.Ignore
-            });
+
+        // Build a sanitized projection of env variables — sensitive ones already carry
+        // "***masked***" as their Value (set in EnvFileAnalyzer), but we defensively
+        // project to an anonymous type so no accidental future field leaks into JSON.
+        var safeEnvVars = data.EnvVariables.Select(e => new
+        {
+            key        = e.Key,
+            value      = e.IsSensitive ? "***masked***" : e.Value,
+            isSensitive = e.IsSensitive,
+            sourceFile = e.SourceFile
+        });
+
+        // Use StringEscapeHandling.EscapeHtml so characters like </script> inside
+        // the JSON payload are unicode-escaped and cannot break out of the <script> block.
+        // CWE-79 / OWASP A03:2021 Injection.
+        var jsonSettings = new JsonSerializerSettings
+        {
+            ContractResolver   = new CamelCasePropertyNamesContractResolver(),
+            NullValueHandling  = NullValueHandling.Ignore,
+            StringEscapeHandling = StringEscapeHandling.EscapeHtml
+        };
+
+        // Serialize a sanitized projection so the JS global never contains raw secrets.
+        var safeData = new
+        {
+            data.Project,
+            data.Meta,
+            data.FileTree,
+            data.ApiEndpoints,
+            data.ApiTraces,
+            data.Packages,
+            data.DependencyGraph,
+            data.Containers,
+            data.Dockerfile,
+            EnvVariables    = safeEnvVars,
+            data.Tests,
+            data.SecurityRisks,
+            data.DesignPatterns,
+            data.CopilotSummary,
+            data.StartupSequence
+        };
+        var jsonData = JsonConvert.SerializeObject(safeData, Formatting.None, jsonSettings);
 
         sb.AppendLine("<!DOCTYPE html>");
         sb.AppendLine("<html lang=\"zh-TW\" data-theme=\"dark\">");
@@ -526,7 +561,10 @@ public class HtmlDashboardGenerator
               <td><code>{HtmlEncode(e.Key)}</code></td>
               <td class="env-value-cell">
                 {(e.IsSensitive
-                    ? $"<span class=\"env-masked\" data-value=\"{HtmlEncode(e.Value)}\" onclick=\"toggleEnvValue(this)\" title=\"點擊顯示/隱藏\">●●●●●●</span>"
+                    // Value is already masked at EnvFileAnalyzer level — no real secret in HTML.
+                    // The span is kept for visual consistency (shows ●●●●●●); clicking reveals the
+                    // already-masked placeholder, which is safe to expose in the rendered page.
+                    ? $"<span class=\"env-masked\" onclick=\"toggleEnvValue(this)\" title=\"點擊顯示/隱藏\">●●●●●●</span><span class=\"env-revealed\" style=\"display:none\"><code>{HtmlEncode(e.Value)}</code></span>"
                     : $"<code>{HtmlEncode(e.Value)}</code>")}
               </td>
               <td>{(e.IsSensitive ? "<span class=\"tag tag-red\">敏感</span>" : "<span class=\"tag tag-green\">安全</span>")}</td>
@@ -1614,17 +1652,22 @@ public class HtmlDashboardGenerator
 
         // ═══ Env Toggle ═══
         function toggleEnvValue(el) {
-          var isHidden = el.textContent === '●●●●●●';
-          el.textContent = isHidden ? (el.dataset.value || '(empty)') : '●●●●●●';
-          el.style.color = isHidden ? 'var(--accent-orange)' : 'var(--text-secondary)';
+          // el is the ●●●●●● span; the sibling .env-revealed span holds the masked placeholder.
+          var revealed = el.nextElementSibling;
+          if (!revealed) return;
+          var isHidden = revealed.style.display === 'none';
+          el.style.display = isHidden ? 'none' : '';
+          revealed.style.display = isHidden ? '' : 'none';
         }
 
         var allEnvShown = false;
         function toggleAllEnv() {
           allEnvShown = !allEnvShown;
           document.querySelectorAll('.env-masked').forEach(function(el) {
-            el.textContent = allEnvShown ? (el.dataset.value || '(empty)') : '●●●●●●';
-            el.style.color = allEnvShown ? 'var(--accent-orange)' : 'var(--text-secondary)';
+            var revealed = el.nextElementSibling;
+            if (!revealed) return;
+            el.style.display = allEnvShown ? 'none' : '';
+            revealed.style.display = allEnvShown ? '' : 'none';
           });
         }
 

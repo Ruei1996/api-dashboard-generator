@@ -15,7 +15,7 @@ public class JsonMetadataGenerator
                 toolVersion = data.Meta.ToolVersion,
                 projectName = data.Meta.ProjectName,
                 branch = data.Meta.Branch,
-                repoPath = data.Meta.RepoPath
+                repoPath = Path.GetFileName(data.Meta.RepoPath) // only the dir name, not the full host path
             },
             languages = data.Project.Languages.Select(l => new
             {

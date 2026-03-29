@@ -9,6 +9,10 @@ namespace RepoInsightDashboard.Analyzers;
 
 public class CopilotSemanticAnalyzer
 {
+    // Shared HttpClient — creating one per request exhausts socket connections.
+    // CLI tools are single-process and short-lived, so a static instance is safe.
+    private static readonly HttpClient _sharedHttp = new() { Timeout = TimeSpan.FromSeconds(60) };
+
     private readonly HttpClient _http;
     private readonly string? _token;
     private const string CopilotEndpoint = "https://api.githubcopilot.com/chat/completions";
@@ -17,9 +21,11 @@ public class CopilotSemanticAnalyzer
 
     public CopilotSemanticAnalyzer(string? copilotToken = null)
     {
-        _token = copilotToken ?? Environment.GetEnvironmentVariable("GITHUB_COPILOT_TOKEN")
-                              ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        // Only accept the Copilot-specific token, never the broad GITHUB_TOKEN (CWE-522).
+        // GITHUB_TOKEN in CI carries repo write access; using it as a Copilot credential
+        // would silently send source code to an external API with an overprivileged token.
+        _token = copilotToken ?? Environment.GetEnvironmentVariable("GITHUB_COPILOT_TOKEN");
+        _http  = _sharedHttp;
     }
 
     public async Task<string?> GenerateProjectSummaryAsync(DashboardData data, CancellationToken ct = default)
@@ -420,8 +426,23 @@ public class CopilotSemanticAnalyzer
 
     // ─── Copilot API ───────────────────────────────────────────────────────
 
+    private static bool _uploadWarningShown;
+
     private async Task<string?> CallCopilotAsync(string userPrompt, int maxTokens, CancellationToken ct)
     {
+        // Inform the user exactly once that source code will leave this machine.
+        // CWE-359 / OWASP A04 — never silently exfiltrate data.
+        if (!_uploadWarningShown)
+        {
+            _uploadWarningShown = true;
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("⚠  [RID] Code snippets will be sent to api.githubcopilot.com for AI analysis.");
+            Console.WriteLine("   Press Ctrl+C within 5 seconds to abort, or wait to continue...");
+            Console.ResetColor();
+            await Task.Delay(5000, ct);
+        }
+
         var payload = new
         {
             model = "gpt-4o",

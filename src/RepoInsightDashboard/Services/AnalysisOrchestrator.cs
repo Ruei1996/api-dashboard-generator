@@ -34,8 +34,12 @@ public class AnalysisOrchestrator
         var scanner = new FileScanner();
         var (fileTree, allFiles) = scanner.Scan(repoPath);
         data.FileTree = fileTree;
-        data.Project.TotalFiles = allFiles.Count(f => !f.IsDirectory);
-        data.Project.TotalSizeBytes = allFiles.Where(f => !f.IsDirectory).Sum(f => f.SizeBytes);
+
+        // Single pass over allFiles for both count and size (avoids two LINQ enumerations).
+        long totalSize = 0; int totalCount = 0;
+        foreach (var f in allFiles) { if (f.IsDirectory) continue; totalCount++; totalSize += f.SizeBytes; }
+        data.Project.TotalFiles     = totalCount;
+        data.Project.TotalSizeBytes = totalSize;
 
         // 3. Language Detection
         Log("[RID] 識別語言...");
@@ -50,53 +54,51 @@ public class AnalysisOrchestrator
             Log("[RID] 已讀取 copilot-instructions.md");
         }
 
-        // 5. Dependency Analysis
-        Log("[RID] 分析依賴套件...");
-        var depAnalyzer = new DependencyAnalyzer();
-        data.Packages = depAnalyzer.Analyze(allFiles);
+        // 5–11. Run independent analyzers concurrently — none share mutable state.
+        // This reduces wall-clock time from the sum of all analyzers to the slowest one.
+        Log("[RID] 並行執行分析器...");
+        var depAnalyzer    = new DependencyAnalyzer();
+        var dockerAnalyzer = new DockerAnalyzer();
+        var swaggerAnalyzer = new SwaggerAnalyzer();
+        var envAnalyzer    = new EnvFileAnalyzer();
+        var testAnalyzer   = new TestAnalyzer();
+
+        var packagesTask    = Task.Run(() => depAnalyzer.Analyze(allFiles), ct);
+        var containersTask  = Task.Run(() => dockerAnalyzer.Analyze(allFiles), ct);
+        var dockerfileTask  = Task.Run(() => dockerAnalyzer.AnalyzeDockerfile(allFiles), ct);
+        var swaggerTask     = Task.Run(() => swaggerAnalyzer.Analyze(allFiles), ct);
+        var envTask         = Task.Run(() => envAnalyzer.Analyze(allFiles), ct);
+        var testsTask       = Task.Run(() => testAnalyzer.Analyze(allFiles), ct);
+
+        await Task.WhenAll(packagesTask, containersTask, dockerfileTask, swaggerTask, envTask, testsTask);
+
+        data.Packages      = packagesTask.Result;
         data.DependencyGraph = depAnalyzer.BuildGraph(data.Packages, data.Project);
         Log($"[RID] 找到 {data.Packages.Count} 個套件");
 
-        // 6. Docker Analysis
-        Log("[RID] 分析 Docker 配置...");
-        var dockerAnalyzer = new DockerAnalyzer();
-        data.Containers = dockerAnalyzer.Analyze(allFiles);
-        data.Dockerfile = dockerAnalyzer.AnalyzeDockerfile(allFiles);
-
-        // Fallback: synthesize container from Dockerfile when no docker-compose
+        data.Dockerfile    = dockerfileTask.Result;
+        data.Containers    = containersTask.Result;
         if (data.Containers.Count == 0 && data.Dockerfile != null)
         {
             data.Containers = dockerAnalyzer.SynthesizeContainersFromDockerfile(data.Dockerfile, projectName);
             Log($"[RID] 從 Dockerfile 合成 {data.Containers.Count} 個服務");
         }
-        else
-        {
-            Log($"[RID] 找到 {data.Containers.Count} 個容器服務");
-        }
+        else Log($"[RID] 找到 {data.Containers.Count} 個容器服務");
 
-        // 8. Swagger/API Analysis
-        Log("[RID] 解析 API 文件...");
-        var swaggerAnalyzer = new SwaggerAnalyzer();
-        data.ApiEndpoints = swaggerAnalyzer.Analyze(allFiles);
+        data.ApiEndpoints  = swaggerTask.Result;
         Log($"[RID] 找到 {data.ApiEndpoints.Count} 個 API 端點");
 
-        // 9. API Trace Analysis
+        data.EnvVariables  = envTask.Result;
+        Log($"[RID] 找到 {data.EnvVariables.Count} 個環境變數");
+
+        data.Tests         = testsTask.Result;
+        Log($"[RID] 測試：{data.Tests.TotalTestCount} 個");
+
+        // 9. API Trace Analysis (depends on ApiEndpoints — must run after swagger)
         Log("[RID] 追蹤 API 執行路徑...");
         var traceAnalyzer = new ApiTraceAnalyzer(repoPath, allFiles);
         data.ApiTraces = traceAnalyzer.AnalyzeTraces(data.ApiEndpoints);
         Log($"[RID] 完成 {data.ApiTraces.Count} 條 API 追蹤路徑");
-
-        // 10. Env Variables
-        Log("[RID] 提取環境變數...");
-        var envAnalyzer = new EnvFileAnalyzer();
-        data.EnvVariables = envAnalyzer.Analyze(allFiles);
-        Log($"[RID] 找到 {data.EnvVariables.Count} 個環境變數");
-
-        // 11. Test Analysis
-        Log("[RID] 分析測試檔案...");
-        var testAnalyzer = new TestAnalyzer();
-        data.Tests = testAnalyzer.Analyze(allFiles);
-        Log($"[RID] 測試：{data.Tests.TotalTestCount} 個（單元:{data.Tests.UnitTests.Sum(f => f.TestCases.Count)} 整合:{data.Tests.IntegrationTests.Sum(f => f.TestCases.Count)} 驗收:{data.Tests.AcceptanceTests.Sum(f => f.TestCases.Count)}）");
 
         // 12. Startup Sequence
         data.StartupSequence = BuildStartupSequence(data);
@@ -108,9 +110,15 @@ public class AnalysisOrchestrator
         else
             Log("[RID] Copilot token 未提供，使用本地分析...");
 
-        data.CopilotSummary = await copilot.GenerateProjectSummaryAsync(data, ct);
-        data.DesignPatterns = await copilot.DetectDesignPatternsAsync(data, ct);
-        data.SecurityRisks = await copilot.DetectSecurityRisksAsync(data, allFiles, repoPath, ct);
+        // Run three independent Copilot API calls concurrently — reduces worst-case
+        // latency from 180 s (3 × 60 s timeout in sequence) to ~60 s.
+        var summaryTask  = copilot.GenerateProjectSummaryAsync(data, ct);
+        var patternsTask = copilot.DetectDesignPatternsAsync(data, ct);
+        var risksTask    = copilot.DetectSecurityRisksAsync(data, allFiles, repoPath, ct);
+        await Task.WhenAll(summaryTask, patternsTask, risksTask);
+        data.CopilotSummary  = summaryTask.Result;
+        data.DesignPatterns  = patternsTask.Result;
+        data.SecurityRisks   = risksTask.Result;
 
         Log("[RID] 分析完成！");
         return data;

@@ -93,10 +93,21 @@ public static class AnalyzeCommand
 
             // Sanitize names for filesystem
             var projectName = SanitizeFileName(data.Meta.ProjectName);
-            var branchName = SanitizeFileName(data.Meta.Branch);
+            var branchName  = SanitizeFileName(data.Meta.Branch);
 
             var htmlFile = Path.Combine(outputPath, $"{projectName}-dashboard-({branchName}).html");
             var jsonFile = Path.Combine(outputPath, $"{projectName}-dashboard-meta-data-({branchName}).json");
+
+            // Canonicalize both paths and assert they are still inside the chosen output
+            // directory — prevents path-traversal if repo name contains '..' segments (CWE-22).
+            var canonicalOutput = Path.GetFullPath(outputPath) + Path.DirectorySeparatorChar;
+            htmlFile = Path.GetFullPath(htmlFile);
+            jsonFile = Path.GetFullPath(jsonFile);
+            if (!htmlFile.StartsWith(canonicalOutput, StringComparison.Ordinal) ||
+                !jsonFile.StartsWith(canonicalOutput, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    "Derived output file path escapes the output directory. " +
+                    "Check that the repository name and branch do not contain '..' segments.");
 
             // Generate HTML
             Console.Write("生成 HTML Dashboard...");

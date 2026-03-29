@@ -7,10 +7,34 @@ public class GitignoreParser
     private readonly List<GitignoreRule> _rules = [];
     private static readonly string[] DefaultIgnores =
     [
-        ".git/", "node_modules/", "bin/", "obj/", ".vs/", ".idea/",
-        "*.user", "*.suo", ".DS_Store", "Thumbs.db", "__pycache__/",
-        "*.pyc", "*.pyo", ".pytest_cache/", "dist/", "build/",
-        "coverage/", ".nyc_output/", "vendor/", "packages/"
+        // Version-control internals
+        ".git/",
+        // JavaScript / Node.js
+        "node_modules/", "dist/", ".next/", ".nuxt/", ".parcel-cache/", ".cache/",
+        ".turbo/", ".svelte-kit/", ".remix/",
+        // .NET / MSBuild
+        "bin/", "obj/", ".vs/", "packages/",
+        // Java / Kotlin / Scala + Rust (both use target/ for build output)
+        "target/", "*.class", "*.jar", "*.war", "*.ear", ".gradle/", ".m2/",
+        // Python
+        "__pycache__/", "*.pyc", "*.pyo", ".pytest_cache/", "*.egg-info/", "*.egg",
+        "venv/", ".venv/", "env/", ".env/", "site-packages/",
+        // Ruby
+        ".bundle/", "vendor/bundle/",
+        // iOS / macOS
+        "Pods/", "*.xcworkspace/",
+        // Elixir / Erlang
+        "_build/", ".mix/", "deps/",
+        // Go
+        "vendor/",
+        // Infrastructure / CI
+        ".terraform/", "*.tfstate", "*.tfstate.backup",
+        // Editor / OS artefacts
+        ".idea/", ".vscode/", "*.user", "*.suo", ".DS_Store", "Thumbs.db",
+        // Test coverage
+        "coverage/", ".nyc_output/",
+        // Misc build artefacts
+        "build/", "out/", "__mocks__/",
     ];
 
     public GitignoreParser(string repoPath)
