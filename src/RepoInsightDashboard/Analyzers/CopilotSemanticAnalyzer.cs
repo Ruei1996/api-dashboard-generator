@@ -1,3 +1,32 @@
+// ============================================================
+// CopilotSemanticAnalyzer.cs — AI-powered and local semantic analysis
+// ============================================================
+//
+// What this class does:
+//   Provides three kinds of semantic insight about a scanned repository:
+//     1. A human-readable project summary (GenerateProjectSummaryAsync)
+//     2. A list of detected architectural design patterns (DetectDesignPatternsAsync)
+//     3. A prioritised security risk report (DetectSecurityRisksAsync)
+//
+// AI vs local fallback:
+//   When a valid GITHUB_COPILOT_TOKEN is available, each analysis task sends
+//   a structured prompt to api.githubcopilot.com/chat/completions and parses
+//   the JSON response.  When no token is present (IsAvailable == false), every
+//   method transparently falls back to a fast, fully-offline implementation:
+//     - GenerateLocalSummary   → template string built from DashboardData
+//     - DetectPatternsLocally  → heuristic package-name matching
+//     - DetectSecurityRisksLocally → seven static regex patterns (OWASP Top 10)
+//
+// Security model:
+//   • Consent warning: the first call that would upload code to Copilot prints a
+//     5-second countdown to STDOUT so users can abort with Ctrl+C (CWE-359).
+//   • No GITHUB_TOKEN: only the Copilot-specific token is accepted.  Using the
+//     broad GITHUB_TOKEN (which carries repo write access) as a Copilot credential
+//     would silently send source code with an overprivileged token (CWE-522).
+//   • Model allowlist: only KnownModels values reach the API, preventing an
+//     injected COPILOT_MODEL value from triggering unexpected API behaviour (CWE-20).
+// ============================================================
+
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -27,9 +56,9 @@ public class CopilotSemanticAnalyzer
     /// </summary>
     private const string DefaultModel = "gpt-4o";
 
-    // Using int (not bool) so Interlocked.Exchange can atomically guarantee the warning fires
-    // exactly once even when multiple CallCopilotAsync tasks run concurrently.
-    // 0 = not shown, 1 = shown.
+    // int (not bool) is required because Interlocked.Exchange only operates on int/long/object.
+    // Using bool would force a lock, negating the point of an atomic flag entirely.
+    // 0 = warning not yet shown; 1 = warning shown.
     private static int _uploadWarningShown;
 
     // ── Static readonly regexes — compiled ONCE per process lifetime ──────────
@@ -154,6 +183,31 @@ public class CopilotSemanticAnalyzer
         return [];
     }
 
+    /// <summary>
+    /// Detects security risks in the repository using a two-stage pipeline:
+    /// local static analysis (always) followed by optional AI deep scan (when token is available).
+    /// </summary>
+    /// <param name="data">
+    /// The fully-populated <see cref="DashboardData"/> produced by the analysis orchestrator.
+    /// Used by both the local and AI stages.
+    /// </param>
+    /// <param name="allFiles">
+    /// Flat list of all scanned <see cref="FileNode"/> objects.  When non-null, enables
+    /// source-code static scanning (regex patterns) and AI code review.
+    /// </param>
+    /// <param name="repoPath">
+    /// Absolute path to the repository root.  Reserved for future path-relative reporting;
+    /// currently unused but kept in the signature for forward compatibility.
+    /// </param>
+    /// <param name="ct">Cancellation token — propagated to all async Copilot API calls.</param>
+    /// <returns>
+    /// De-duplicated, priority-sorted list of <see cref="SecurityRisk"/> objects.
+    /// Priority 1 = Critical (fix immediately), 4 = Info/Low (advisory).
+    /// </returns>
+    /// <remarks>
+    /// De-duplication uses a <see cref="HashSet{T}"/> of <c>(Title, FilePath)</c> tuples,
+    /// turning the naive O(n²) "does this already exist?" check into O(n) (one HashSet.Add per item).
+    /// </remarks>
     public async Task<List<SecurityRisk>> DetectSecurityRisksAsync(
         DashboardData data,
         List<FileNode>? allFiles = null,
@@ -195,6 +249,22 @@ public class CopilotSemanticAnalyzer
 
     // ─── AI Security Analysis ──────────────────────────────────────────────
 
+    /// <summary>
+    /// Sends representative source-code excerpts to the Copilot API and requests an
+    /// OWASP Top 10–aligned security review, returning the parsed risk list.
+    /// </summary>
+    /// <param name="data">Project metadata used to build the prompt context.</param>
+    /// <param name="allFiles">Full file list used to select which files to excerpt.</param>
+    /// <param name="ct">Cancellation token propagated to the HTTP call.</param>
+    /// <returns>
+    /// List of <see cref="SecurityRisk"/> objects parsed from the AI JSON response,
+    /// or an empty list if the API call fails or returns unparseable content.
+    /// </returns>
+    /// <remarks>
+    /// File selection strategy: controllers, auth files, and middleware are ranked highest
+    /// because they are the most likely attack surface.  At most 8 files are sent and each
+    /// is truncated to 2 500 characters to keep the prompt within the model's context window.
+    /// </remarks>
     private async Task<List<SecurityRisk>> AnalyzeCodeSecurityWithAIAsync(
         DashboardData data, List<FileNode> allFiles, CancellationToken ct)
     {
@@ -301,6 +371,24 @@ public class CopilotSemanticAnalyzer
 
     // ─── Local Static Analysis ─────────────────────────────────────────────
 
+    /// <summary>
+    /// Performs offline static analysis against common OWASP Top 10 vulnerability patterns
+    /// using pre-compiled regular expressions.  No network calls are made.
+    /// </summary>
+    /// <param name="data">
+    /// Dashboard data providing env-variable metadata, deprecated API flags,
+    /// and container port mappings for infrastructure-level risk checks.
+    /// </param>
+    /// <param name="allFiles">
+    /// When non-null, source files are read from disk and matched against
+    /// seven regex patterns covering OWASP A1–A8.  When null, only metadata-derived
+    /// checks (env vars, deprecated endpoints, risky ports) are performed.
+    /// </param>
+    /// <param name="repoPath">Reserved for future use; currently unused.</param>
+    /// <returns>
+    /// Unordered list of detected <see cref="SecurityRisk"/> objects.
+    /// The caller (<see cref="DetectSecurityRisksAsync"/>) is responsible for sorting.
+    /// </returns>
     private List<SecurityRisk> DetectSecurityRisksLocally(
         DashboardData data, List<FileNode>? allFiles, string? repoPath)
     {
@@ -496,23 +584,41 @@ public class CopilotSemanticAnalyzer
 
     // ─── Copilot API ───────────────────────────────────────────────────────
 
-    // Using int so Interlocked.Exchange can operate atomically — plain bool read/write
-    // is not guaranteed atomic by the C# memory model across concurrent async callers.
-    // 0 = warning not yet shown; 1 = warning shown.
-    // Declared here (not at the class top) to stay adjacent to the method that uses it.
-    // Note: the static readonly regex fields and _uploadWarningShown are defined higher in the class.
-
-    // Model allowlist — validated at construction time; unknown values fall back to DefaultModel.
-    // Restricts the model sent to the API to values we know the Copilot endpoint accepts (CWE-20).
+    // Allowlist of model identifiers accepted by the Copilot chat-completions endpoint.
+    // An unexpected COPILOT_MODEL value (typo, injection) is silently replaced with
+    // DefaultModel rather than forwarded to the API, preventing silent HTTP 422 errors
+    // and limiting the blast radius of a misconfigured environment (CWE-20).
     private static readonly HashSet<string> KnownModels = new(StringComparer.OrdinalIgnoreCase)
         { "gpt-4o", "gpt-4o-mini", "gpt-4.1" };
 
+    /// <summary>
+    /// Sends a single chat-completion request to the Copilot API and returns the text content
+    /// of the first response choice, or <c>null</c> on any failure.
+    /// </summary>
+    /// <param name="userPrompt">The full user-turn prompt text to send.</param>
+    /// <param name="maxTokens">
+    /// Upper bound on response tokens.  Tune per call site to avoid truncation on long
+    /// structured responses (e.g. JSON arrays) while keeping short summaries cheap.
+    /// </param>
+    /// <param name="ct">
+    /// Cancellation token.  <see cref="OperationCanceledException"/> is always re-thrown
+    /// so the caller's <see cref="Task.WhenAll"/> propagates user Ctrl+C correctly.
+    /// </param>
+    /// <returns>
+    /// The model's response string, or <c>null</c> if the API returns a non-2xx status
+    /// or if any network/parsing error occurs.
+    /// </returns>
+    /// <remarks>
+    /// The first invocation (across all concurrent callers in a <c>Task.WhenAll</c>) displays
+    /// a 5-second consent warning.  Subsequent callers skip it atomically via
+    /// <see cref="Interlocked.Exchange"/> on <see cref="_uploadWarningShown"/>.
+    /// </remarks>
     private async Task<string?> CallCopilotAsync(string userPrompt, int maxTokens, CancellationToken ct)
     {
-        // Atomic one-shot: Interlocked.Exchange returns the OLD value.
-        // Only the first caller (old value == 0) enters the warning block.
-        // Concurrent callers from Task.WhenAll see old value == 1 and skip it.
-        // This replaces the previous non-atomic bool check-then-set pattern.
+        // Interlocked.Exchange atomically writes 1 and returns the PREVIOUS value.
+        // Only the very first caller sees 0 (old value) and enters the warning block.
+        // All concurrent callers from Task.WhenAll already see 1 and skip the warning,
+        // guaranteeing the countdown is shown exactly once even under parallelism.
         if (Interlocked.Exchange(ref _uploadWarningShown, 1) == 0)
         {
             Console.WriteLine();
@@ -523,8 +629,9 @@ public class CopilotSemanticAnalyzer
             await Task.Delay(5000, ct);
         }
 
-        // Validate model against the allowlist; fall back to DefaultModel on unknown input.
-        // Prevents an injected COPILOT_MODEL value from silently causing API errors (CWE-20).
+        // Validate _model against KnownModels before sending it to the API.
+        // safeModel is always a literal string from KnownModels or DefaultModel, never
+        // a raw user-supplied value — this prevents prompt/header injection (CWE-20).
         var safeModel = KnownModels.Contains(_model) ? _model : DefaultModel;
 
         var payload = new
@@ -582,6 +689,12 @@ public class CopilotSemanticAnalyzer
 
     // ─── Local Fallbacks ───────────────────────────────────────────────────
 
+    /// <summary>
+    /// Generates a brief project summary from <see cref="DashboardData"/> without any AI call.
+    /// Used when <see cref="IsAvailable"/> is <c>false</c> (no Copilot token configured).
+    /// </summary>
+    /// <param name="data">Populated dashboard data to summarise.</param>
+    /// <returns>A single Markdown-compatible sentence describing the project.</returns>
     private string GenerateLocalSummary(DashboardData data)
     {
         var langs = string.Join("、", data.Project.Languages.Take(3).Select(l => l.Name));
@@ -597,6 +710,20 @@ public class CopilotSemanticAnalyzer
                $"分支：{data.Project.Branch}。";
     }
 
+    /// <summary>
+    /// Infers architectural design patterns from package names and project structure
+    /// without any AI call.  Used as a fast offline fallback when no Copilot token is set.
+    /// </summary>
+    /// <param name="data">Populated dashboard data used for heuristic matching.</param>
+    /// <returns>
+    /// List of detected pattern names (e.g. "微服務架構", "RESTful API", "gRPC 通訊").
+    /// Returns an empty list if no patterns are matched.
+    /// </returns>
+    /// <remarks>
+    /// Package scanning uses a single O(P) loop with early-exit once all three flags are found,
+    /// rather than three separate <c>.Any()</c> traversals which would each scan up to P items —
+    /// worst-case O(3P) vs O(P) for large dependency lists.
+    /// </remarks>
     private List<string> DetectPatternsLocally(DashboardData data)
     {
         var patterns = new List<string>();
@@ -614,7 +741,8 @@ public class CopilotSemanticAnalyzer
             if (!hasMessageQueue && (name.Contains("kafka",     StringComparison.OrdinalIgnoreCase) ||
                                      name.Contains("rabbitmq",  StringComparison.OrdinalIgnoreCase))) hasMessageQueue = true;
             if (!hasRedis        && name.Contains("redis",      StringComparison.OrdinalIgnoreCase)) hasRedis = true;
-            if (hasGrpc && hasMessageQueue && hasRedis) break; // Early exit once all found.
+            // Early exit: once all three flags are set, further iterations cannot add new patterns.
+            if (hasGrpc && hasMessageQueue && hasRedis) break;
         }
         if (hasGrpc)         patterns.Add("gRPC 通訊");
         if (hasMessageQueue) patterns.Add("訊息佇列");

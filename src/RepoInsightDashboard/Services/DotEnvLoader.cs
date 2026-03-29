@@ -1,3 +1,28 @@
+// ============================================================
+// DotEnvLoader.cs — Static .env file loader for the rid CLI
+// ============================================================
+//
+// Architecture:
+//   Static utility class — no instances, no DI registration.
+//   Implements a lightweight state machine via the _loadedPath field:
+//     null       → Load() has never been called in this process
+//     Sentinel   → Load() ran but found no file (distinguished from null to prevent re-search)
+//     <path>     → an absolute path to the file that was successfully loaded
+//   All state transitions are performed through Interlocked / Volatile primitives
+//   so the class is safe to call from multiple threads without a lock.
+//
+// Security (CWE-426 — Untrusted Search Path):
+//   Only keys in the AllowedKeys set are injected into the process environment.
+//   This prevents a malicious .env planted in a shared/writable CWD from hijacking
+//   PATH, LD_PRELOAD, JAVA_HOME, or any other variable the tool does not need.
+//
+// Usage:
+//   // Call once at process startup — all subsequent calls return the cached result.
+//   string? envFile = DotEnvLoader.Load();
+//   // Optional: supply an explicit path (CI override scenario)
+//   string? envFile = DotEnvLoader.Load("/ci/secrets/.env");
+// ============================================================
+
 using System.Diagnostics;
 
 namespace RepoInsightDashboard.Services;
@@ -50,14 +75,41 @@ public static class DotEnvLoader
         "GITHUB_COPILOT_TOKEN",
         "COPILOT_MODEL"
     };
+
     // Written atomically via Interlocked so parallel test runners stay race-free.
     private static string? _loadedPath;
 
-    // Sentinel value stored in _loadedPath when Load() ran but found no file.
-    // This distinguishes "not yet run" (null) from "ran, found nothing" (Sentinel).
+    // Sentinel value stored in _loadedPath when Load() ran but found no .env file.
+    // Storing "" (not null) lets Volatile.Read distinguish two different states:
+    //   null      → Load() has never been invoked → search must still happen
+    //   Sentinel  → Load() ran and exhausted all candidate paths → skip re-search
+    // Without this sentinel, a second call would retry the filesystem search on every
+    // invocation when no file exists, which wastes I/O and breaks idempotency guarantees.
     private const string Sentinel = "";
 
-    // Candidate locations searched in order.
+    /// <summary>
+    /// Returns the ordered list of .env file paths to try, from highest to lowest priority.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The search order follows XDG Base Directory Specification conventions:
+    /// <list type="number">
+    ///   <item>
+    ///     <b>CWD</b> — <c>$(pwd)/.env</c> — most common for local development;
+    ///     developers typically keep a project-specific .env alongside their Makefile.
+    ///   </item>
+    ///   <item>
+    ///     <b>XDG user config</b> — <c>$XDG_CONFIG_HOME/rid/.env</c> (falls back to
+    ///     <c>~/.config/rid/.env</c> when <c>XDG_CONFIG_HOME</c> is unset) — allows a single
+    ///     token to be shared across all repositories without committing it anywhere.
+    ///   </item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Implemented as an iterator (<c>yield return</c>) so the caller can stop after the
+    /// first successful load without allocating a full list of paths upfront.
+    /// </para>
+    /// </remarks>
     private static IEnumerable<string> CandidatePaths()
     {
         // 1. CWD — most common for local development workflows.
@@ -85,8 +137,10 @@ public static class DotEnvLoader
     /// </returns>
     public static string? Load(string? explicitPath = null)
     {
-        // Idempotency check: if Load() already ran in this process, return the cached result.
-        // Volatile.Read prevents the JIT from caching the field value in a register.
+        // Volatile.Read issues a memory barrier that prevents the JIT/CPU from serving
+        // a stale register-cached value of _loadedPath on subsequent calls.
+        // Without it, a thread that already ran Load() might see null forever due to
+        // CPU store-buffer reordering, causing repeated (and wasted) filesystem searches.
         var cached = Volatile.Read(ref _loadedPath);
         if (cached != null)
             return cached == Sentinel ? null : cached;
@@ -104,9 +158,10 @@ public static class DotEnvLoader
                 // surface naturally and handle it in the catch below.
                 LoadFile(path);
 
-                // Publish the loaded path atomically; a concurrent caller may have beaten us
-                // but that's fine — both loaded the same file and the "no overwrite" rule
-                // inside LoadFile is idempotent.
+                // Interlocked.CompareExchange atomically sets _loadedPath = path ONLY IF
+                // _loadedPath is still null.  If a concurrent caller already stored a path,
+                // we leave their value in place — both callers loaded the same file, and
+                // the "no overwrite" rule inside LoadFile is idempotent, so no harm done.
                 Interlocked.CompareExchange(ref _loadedPath, path, null);
                 return path;
             }
@@ -183,8 +238,10 @@ public static class DotEnvLoader
 
             // Priority rule: only inject the value if the variable is ABSENT from the environment.
             // GetEnvironmentVariable returns null for absent vars and "" for present-but-empty.
-            // Checking `is null` (not IsNullOrEmpty) correctly honours an intentional empty export:
-            //   export GITHUB_COPILOT_TOKEN=   → env var is "", NOT null → we skip it.
+            // We check `is null` (not IsNullOrEmpty) so that an intentional empty shell export
+            //   export GITHUB_COPILOT_TOKEN=
+            // is correctly treated as "present with empty value" (returns "") and is NOT
+            // overwritten by the .env file.  IsNullOrEmpty would incorrectly overwrite it.
             if (Environment.GetEnvironmentVariable(key) is null)
             {
                 Environment.SetEnvironmentVariable(key, value);

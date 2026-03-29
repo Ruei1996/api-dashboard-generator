@@ -1,27 +1,71 @@
+// ============================================================
+// FileScanner.cs — Repository file tree walker
+// ============================================================
+// Architecture: stateless service class; instantiated once per analyze run.
+// Pattern: recursive DFS with gitignore filtering and forced-include overrides.
+//
+// Security:
+//   Symlink targets are resolved and validated against the repo root before
+//   recursion, preventing directory-traversal via crafted symlinks (CWE-22).
+//
+// Usage:
+//   var scanner = new FileScanner();
+//   var (tree, allFiles) = scanner.Scan("/path/to/repo");
+// ============================================================
+
 using RepoInsightDashboard.Models;
 
 namespace RepoInsightDashboard.Analyzers;
 
 /// <summary>
-/// Recursively walks a repository's directory tree, respects .gitignore rules,
-/// and returns a flat list of <see cref="FileNode"/> objects with language tags.
-/// Symlink-escape and depth-overflow protection are built in.
+/// Recursively walks a repository's directory tree, applies .gitignore filtering,
+/// and returns both a hierarchical <see cref="FileNode"/> tree and a flat file list.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Files listed in <c>ForceInclude</c> are always returned regardless of .gitignore rules.
+/// This ensures that files critical to the analysis (e.g. <c>.env</c>, <c>service.swagger.json</c>)
+/// are never silently skipped, even if the developer added them to .gitignore.
+/// </para>
+/// <para>
+/// Symlinks that resolve outside the repository root are silently skipped to prevent
+/// directory-traversal attacks via crafted <c>ln -s /etc repo/link</c> paths (CWE-22).
+/// </para>
+/// <para>
+/// The recursive descent is capped at <c>MaxDepth = 60</c> levels to guard against
+/// pathological monorepos or maliciously deep directory structures that could cause
+/// a <see cref="StackOverflowException"/>.
+/// </para>
+/// </remarks>
 public class FileScanner
 {
     // Files that must be included even if .gitignore would exclude them.
+    // These are files the rid tool specifically needs to function correctly.
     private static readonly HashSet<string> ForceInclude = new(StringComparer.OrdinalIgnoreCase)
     {
         ".env", "service.swagger.json", "copilot-instructions.md"
     };
 
-    // Maximum directory depth to recurse to, preventing stack overflow on pathological repos.
+    // Maximum directory depth to recurse into.
+    // 60 levels covers any realistic repository layout (monorepos, deeply nested packages)
+    // while preventing a stack overflow if a symlink loop somehow bypasses the reparse-point
+    // check below, or if the repo contains an unusually deep generated directory structure.
     private const int MaxDepth = 60;
 
     /// <summary>
-    /// Scans the repository at <paramref name="repoPath"/> and returns a tree representation
-    /// alongside a flat list of all discovered files (directories excluded).
+    /// Scans the repository rooted at <paramref name="repoPath"/> and returns its file tree
+    /// alongside a flat list of all discovered non-directory nodes.
     /// </summary>
+    /// <param name="repoPath">
+    /// Absolute path to the repository root.  Must exist and be a directory.
+    /// </param>
+    /// <returns>
+    /// A tuple containing:
+    /// <list type="bullet">
+    ///   <item><see cref="FileNode"/> <c>Tree</c> — the root node of the hierarchical tree.</item>
+    ///   <item><c>List&lt;FileNode&gt;</c> <c>AllFiles</c> — flat list of every file node (directories excluded).</item>
+    /// </list>
+    /// </returns>
     public (FileNode Tree, List<FileNode> AllFiles) Scan(string repoPath)
     {
         var parser = new GitignoreParser(repoPath);
@@ -38,10 +82,22 @@ public class FileScanner
         return (root, allFiles);
     }
 
+    /// <summary>
+    /// Recursively populates <paramref name="parentNode"/> and <paramref name="allFiles"/>
+    /// by iterating the contents of <paramref name="currentPath"/>.
+    /// </summary>
+    /// <param name="basePath">Absolute path to the repository root (unchanged across recursion).</param>
+    /// <param name="currentPath">Absolute path to the directory currently being processed.</param>
+    /// <param name="parentNode">The <see cref="FileNode"/> that will receive child entries.</param>
+    /// <param name="allFiles">Accumulator for all discovered file nodes (directories excluded).</param>
+    /// <param name="parser">Gitignore rule engine seeded from the repository root.</param>
+    /// <param name="depth">Current recursion depth; compared against <see cref="MaxDepth"/>.</param>
     private void ScanDirectory(string basePath, string currentPath, FileNode parentNode,
         List<FileNode> allFiles, GitignoreParser parser, int depth)
     {
-        // Guard against infinite recursion or symlink loops.
+        // MaxDepth guard: abort recursion if the directory tree is unreasonably deep.
+        // This prevents a StackOverflowException on pathological repos and limits CPU
+        // time spent traversing auto-generated or infinitely-symlinked structures.
         if (depth > MaxDepth) return;
 
         try
@@ -50,8 +106,12 @@ public class FileScanner
             {
                 var relativePath = Path.GetRelativePath(basePath, dir).Replace('\\', '/');
 
-                // Reject symlinks that point outside the repo root to prevent directory
-                // traversal via crafted ln -s /etc repo/link attacks (CWE-22).
+                // Symlink escape prevention (CWE-22 — Path Traversal):
+                // A crafted repository could contain a symlink like:
+                //   repo/evil -> /etc
+                // Without this check, ScanDirectory would descend into /etc and expose
+                // system files.  We resolve the symlink's final target and ensure it
+                // stays inside basePath before recursing.
                 var dirInfo = new DirectoryInfo(dir);
                 if (dirInfo.Attributes.HasFlag(FileAttributes.ReparsePoint))
                 {
@@ -59,8 +119,10 @@ public class FileScanner
                     if (target != null)
                     {
                         var resolved = Path.GetFullPath(target.FullName);
+                        // StringComparison.Ordinal is intentional: path comparison must be
+                        // byte-exact to prevent case-folding or Unicode normalisation tricks.
                         if (!resolved.StartsWith(basePath, StringComparison.Ordinal))
-                            continue;
+                            continue; // Target escapes repo root — skip entirely.
                     }
                 }
 
@@ -99,6 +161,8 @@ public class FileScanner
                     Extension = ext,
                     LastModified = info.LastWriteTime,
                     // Try extension first; fall back to special filename detection.
+                    // e.g. "Dockerfile" has no extension, so LanguageDetector.GetLanguage("")
+                    // returns null and the filename-based overload handles it.
                     Language = LanguageDetector.GetLanguage(ext)
                                ?? LanguageDetector.GetLanguageForFile(ext, fileName)
                 };
@@ -106,9 +170,19 @@ public class FileScanner
                 allFiles.Add(fileNode);
             }
         }
-        catch (IOException) { /* skip inaccessible or unreadable directories */ }
+        catch (IOException)
+        {
+            // IOException is intentionally broad here — it covers UnauthorizedAccessException
+            // (permission-denied directories), DirectoryNotFoundException (race-deleted dirs),
+            // and network path errors.  All of these are non-fatal: we skip the unreadable
+            // directory and continue scanning the rest of the tree.
+        }
     }
 
+    /// <summary>
+    /// Returns <c>true</c> if the file at <paramref name="relativePath"/> is in the
+    /// <see cref="ForceInclude"/> set and must always be returned regardless of .gitignore.
+    /// </summary>
     private static bool IsForceIncludedPath(string relativePath)
     {
         var fileName = Path.GetFileName(relativePath);

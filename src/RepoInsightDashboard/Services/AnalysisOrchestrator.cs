@@ -1,15 +1,91 @@
+// ============================================================
+// AnalysisOrchestrator.cs — Top-level analysis pipeline coordinator
+// ============================================================
+// Architecture: orchestrator / facade over all analyzer classes.
+//   Follows the "fat coordinator, thin analyzers" pattern:
+//   each analyzer is a stateless, single-responsibility class;
+//   this class owns the sequencing, concurrency, and result assembly.
+//
+// Concurrency model:
+//   Five analyzers (dependency, docker, swagger, env, tests) are independent
+//   of each other's output and run concurrently via Task.WhenAll.
+//   ApiTraceAnalyzer is intentionally excluded from that group because it
+//   requires data.ApiEndpoints, which is produced by SwaggerAnalyzer.
+//   Three Copilot API calls also run concurrently via a second Task.WhenAll.
+//
+// Usage:
+//   var orchestrator = new AnalysisOrchestrator(verbose: true);
+//   DashboardData data = await orchestrator.AnalyzeAsync(repoPath, "dark", token, ct);
+// ============================================================
+
 using LibGit2Sharp;
 using RepoInsightDashboard.Analyzers;
 using RepoInsightDashboard.Models;
 
 namespace RepoInsightDashboard.Services;
 
+/// <summary>
+/// Coordinates the full repository analysis pipeline, executing independent analyzers
+/// concurrently and assembling their results into a single <see cref="DashboardData"/> object.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The pipeline runs in three sequential phases:
+/// <list type="number">
+///   <item>
+///     <b>Serial setup</b> — Git metadata, file scan, language detection, and Copilot instructions.
+///     These must complete in order because later phases depend on the file list.
+///   </item>
+///   <item>
+///     <b>Concurrent analyzers</b> — Dependency, Docker, Swagger, EnvFile, and Test analyzers
+///     run in parallel via <c>Task.WhenAll</c>, then <c>ApiTraceAnalyzer</c> runs serially
+///     because it requires the endpoint list produced by <c>SwaggerAnalyzer</c>.
+///   </item>
+///   <item>
+///     <b>Concurrent Copilot calls</b> — Summary, design-pattern, and security-risk requests
+///     are sent to the Copilot API concurrently to minimise wall-clock latency.
+///   </item>
+/// </list>
+/// </para>
+/// </remarks>
 public class AnalysisOrchestrator
 {
     private readonly bool _verbose;
 
+    /// <summary>
+    /// Initialises the orchestrator.
+    /// </summary>
+    /// <param name="verbose">
+    /// When <c>true</c>, progress messages are written to stdout as full lines.
+    /// When <c>false</c>, a single dot is printed per step to indicate liveness
+    /// without flooding CI logs.
+    /// </param>
     public AnalysisOrchestrator(bool verbose = false) => _verbose = verbose;
 
+    /// <summary>
+    /// Runs the complete repository analysis pipeline and returns a fully-populated
+    /// <see cref="DashboardData"/> object ready for rendering.
+    /// </summary>
+    /// <param name="repoPath">
+    /// Path to the repository root directory.  Relative paths are resolved to
+    /// absolute via <see cref="Path.GetFullPath"/> before any file I/O occurs.
+    /// </param>
+    /// <param name="theme">
+    /// Dashboard colour theme name (e.g. "dark", "light") stored in
+    /// <see cref="DashboardData.Meta"/> and passed through to the renderer.
+    /// </param>
+    /// <param name="copilotToken">
+    /// Optional GitHub Copilot API token.  When null or empty, all AI analysis
+    /// falls back to local heuristics and no network calls are made.
+    /// </param>
+    /// <param name="ct">
+    /// Cancellation token propagated to all async operations.  Pressing Ctrl+C
+    /// will abort the pipeline cleanly; partially-computed results are discarded.
+    /// </param>
+    /// <returns>
+    /// A <see cref="DashboardData"/> containing file tree, language breakdown,
+    /// API endpoints, security risks, design patterns, and a project summary.
+    /// </returns>
     public async Task<DashboardData> AnalyzeAsync(
         string repoPath, string theme, string? copilotToken, CancellationToken ct = default)
     {
@@ -35,7 +111,9 @@ public class AnalysisOrchestrator
         var (fileTree, allFiles) = scanner.Scan(repoPath);
         data.FileTree = fileTree;
 
-        // Single pass over allFiles for both count and size (avoids two LINQ enumerations).
+        // Single-pass file stats: iterate allFiles ONCE to compute both TotalFiles and TotalSizeBytes.
+        // Two separate LINQ expressions (.Count() + .Sum()) would traverse the list twice — O(2n).
+        // For large repos (50 k+ files) this halves the iteration cost of this step.
         long totalSize = 0; int totalCount = 0;
         foreach (var f in allFiles) { if (f.IsDirectory) continue; totalCount++; totalSize += f.SizeBytes; }
         data.Project.TotalFiles     = totalCount;
@@ -54,8 +132,11 @@ public class AnalysisOrchestrator
             Log("[RID] 已讀取 copilot-instructions.md");
         }
 
-        // 5–11. Run independent analyzers concurrently — none share mutable state.
-        // This reduces wall-clock time from the sum of all analyzers to the slowest one.
+        // 5–10. Run five independent analyzers concurrently via Task.WhenAll.
+        // None of these analyzers share mutable state, so they are safe to run in parallel.
+        // Wall-clock time is bounded by the slowest analyzer instead of their sum:
+        //   serial:   T(dep) + T(docker) + T(swagger) + T(env) + T(tests)
+        //   parallel: max(T(dep), T(docker), T(swagger), T(env), T(tests))
         Log("[RID] 並行執行分析器...");
         var depAnalyzer    = new DependencyAnalyzer();
         var dockerAnalyzer = new DockerAnalyzer();
@@ -94,7 +175,10 @@ public class AnalysisOrchestrator
         data.Tests         = testsTask.Result;
         Log($"[RID] 測試：{data.Tests.TotalTestCount} 個");
 
-        // 9. API Trace Analysis (depends on ApiEndpoints — must run after swagger)
+        // ApiTraceAnalyzer runs AFTER the concurrent batch because it requires data.ApiEndpoints
+        // (produced by SwaggerAnalyzer above).  Including it in the Task.WhenAll group would
+        // cause a race condition: it might start before swaggerTask completes and operate on
+        // an empty endpoint list, producing zero trace paths silently.
         Log("[RID] 追蹤 API 執行路徑...");
         var traceAnalyzer = new ApiTraceAnalyzer(repoPath, allFiles);
         data.ApiTraces = traceAnalyzer.AnalyzeTraces(data.ApiEndpoints);
@@ -124,6 +208,15 @@ public class AnalysisOrchestrator
         return data;
     }
 
+    /// <summary>
+    /// Reads the repository's Git metadata (project name from directory, current branch name,
+    /// and most recent commit message) using LibGit2Sharp.
+    /// </summary>
+    /// <param name="repoPath">Absolute path to the repository root.</param>
+    /// <returns>
+    /// A tuple of (name, branch) where name is the directory basename and branch is the
+    /// friendly branch name, defaulting to "main" if the repository is invalid or bare.
+    /// </returns>
     private (string name, string branch) GetGitInfo(string repoPath)
     {
         var name = Path.GetFileName(repoPath);
@@ -143,6 +236,15 @@ public class AnalysisOrchestrator
         return (name, branch);
     }
 
+    /// <summary>
+    /// Performs a topological sort of container services based on their <c>depends_on</c>
+    /// declarations and returns an ordered startup sequence.
+    /// </summary>
+    /// <param name="data">Dashboard data containing the container list with dependency edges.</param>
+    /// <returns>
+    /// Ordered list of container names from least-dependent to most-dependent.
+    /// Returns an empty list when no containers are present.
+    /// </returns>
     private List<string> BuildStartupSequence(DashboardData data)
     {
         if (data.Containers.Count == 0) return [];
@@ -160,6 +262,9 @@ public class AnalysisOrchestrator
         return order;
     }
 
+    /// <summary>
+    /// Writes a progress message to stdout (verbose mode) or a single dot (quiet mode).
+    /// </summary>
     private void Log(string message)
     {
         if (_verbose) Console.WriteLine(message);

@@ -1,3 +1,17 @@
+// ============================================================
+// SwaggerAnalyzer.cs — Multi-format API specification parser
+// ============================================================
+// Architecture: stateless service class; instantiated once per analyze run.
+// Supported formats:
+//   1. OpenAPI / Swagger (JSON + YAML) — parsed via Microsoft.OpenApi.Readers
+//   2. GraphQL schemas (.graphql / .gql) — regex-based field extraction
+//   3. gRPC Protocol Buffers (.proto) — regex-based rpc method extraction
+//
+// Usage:
+//   var analyzer = new SwaggerAnalyzer();
+//   List<ApiEndpoint> endpoints = analyzer.Analyze(allFiles);
+// ============================================================
+
 using System.Text.RegularExpressions;
 using Microsoft.OpenApi.Models;
 using Microsoft.OpenApi.Readers;
@@ -18,14 +32,35 @@ namespace RepoInsightDashboard.Analyzers;
 public class SwaggerAnalyzer
 {
     // Maximum file size (bytes) for OpenAPI / GraphQL / proto parsing — 10 MB guard.
+    // Extremely large spec files are almost always auto-generated bundles (swagger-ui dist)
+    // rather than hand-authored API definitions; parsing them wastes memory and CPU.
     private const long MaxFileSizeBytes = 10 * 1024 * 1024;
 
-    /// <summary>Returns all discovered API endpoints across OpenAPI, GraphQL, and gRPC specs.</summary>
+    /// <summary>
+    /// Scans <paramref name="files"/> for OpenAPI, GraphQL, and gRPC spec files and returns
+    /// a unified list of <see cref="ApiEndpoint"/> objects discovered across all formats.
+    /// </summary>
+    /// <param name="files">
+    /// Flat list of <see cref="FileNode"/> objects produced by <see cref="FileScanner"/>.
+    /// Directory nodes and files over 10 MB are silently skipped.
+    /// </param>
+    /// <returns>
+    /// Combined list of <see cref="ApiEndpoint"/> objects from all three parsers.
+    /// GraphQL fields and gRPC RPC methods are surfaced as pseudo-endpoints with
+    /// synthetic HTTP methods (QUERY, MUTATION, SUBSCRIPTION, RPC, STREAM) to allow
+    /// uniform display in the dashboard.
+    /// </returns>
+    /// <remarks>
+    /// Parse failures for individual files are silently swallowed so that one malformed
+    /// spec does not abort the entire analysis.  Errors are not logged because doing so
+    /// would pollute the progress output for repositories with many non-spec JSON files.
+    /// </remarks>
     public List<ApiEndpoint> Analyze(List<FileNode> files)
     {
         var endpoints = new List<ApiEndpoint>();
 
-        // 1. OpenAPI / Swagger documents
+        // 1. OpenAPI / Swagger documents — uses the official Microsoft.OpenApi parser which
+        //    handles both JSON and YAML and resolves $ref pointers within the same document.
         foreach (var file in files.Where(f => !f.IsDirectory && IsSwaggerFile(f) && f.SizeBytes < MaxFileSizeBytes))
         {
             try
@@ -98,14 +133,17 @@ public class SwaggerAnalyzer
             catch { /* skip malformed files */ }
         }
 
-        // 2. GraphQL schema files — synthesise pseudo-endpoints for each Query/Mutation field
+        // 2. GraphQL schema files — synthesise pseudo-endpoints for each Query/Mutation/Subscription field.
+        //    GraphQL does not have HTTP verbs, so we map operation types to synthetic method names
+        //    (QUERY, MUTATION, SUBSCRIPTION) that the dashboard renders with appropriate icons.
         foreach (var file in files.Where(f => !f.IsDirectory && IsGraphQlFile(f) && f.SizeBytes < MaxFileSizeBytes))
         {
             try { endpoints.AddRange(ParseGraphQlSchema(file)); }
             catch { }
         }
 
-        // 3. gRPC proto files — synthesise pseudo-endpoints for each rpc method
+        // 3. gRPC proto files — synthesise pseudo-endpoints for each rpc method.
+        //    RPC and streaming methods are surfaced as "RPC" and "STREAM" method types respectively.
         foreach (var file in files.Where(f => !f.IsDirectory && f.Extension == ".proto" && f.SizeBytes < MaxFileSizeBytes))
         {
             try { endpoints.AddRange(ParseProtoFile(file)); }
@@ -117,6 +155,15 @@ public class SwaggerAnalyzer
 
     // ── File-type Detectors ───────────────────────────────────────────────────
 
+    /// <summary>
+    /// Returns <c>true</c> if <paramref name="file"/> is likely an OpenAPI/Swagger spec file.
+    /// </summary>
+    /// <remarks>
+    /// The extension whitelist (.json, .yaml, .yml) is intentional: it prevents the analyser
+    /// from wasting CPU trying to parse swagger-ui bundle scripts (.js), README files (.md),
+    /// or generator config files (.sh) as API specs.  Name-based matching then narrows to
+    /// files that are semantically API descriptions.
+    /// </remarks>
     private static bool IsSwaggerFile(FileNode file)
     {
         // Restrict to structured data formats only — prevents wasting CPU trying to parse
@@ -133,12 +180,27 @@ public class SwaggerAnalyzer
 
     // ── GraphQL Parser ────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Extracts Query, Mutation, and Subscription fields from a GraphQL schema file
+    /// and returns them as synthetic <see cref="ApiEndpoint"/> objects.
+    /// </summary>
+    /// <param name="file">The .graphql or .gql file to parse.</param>
+    /// <returns>One <see cref="ApiEndpoint"/> per discovered field.</returns>
+    /// <remarks>
+    /// Uses regex rather than a full GraphQL parser to avoid the dependency on an
+    /// external GraphQL library.  The regex handles <c>type</c> and <c>extend type</c>
+    /// declarations and captures the field name and return type from each operation block.
+    /// Inline argument definitions — <c>fieldName(arg: Type): ReturnType</c> — are skipped
+    /// by the non-capturing group <c>(?:\([^)]*\))?</c>.
+    /// </remarks>
     private static List<ApiEndpoint> ParseGraphQlSchema(FileNode file)
     {
         var endpoints = new List<ApiEndpoint>();
         var content = File.ReadAllText(file.AbsolutePath);
 
-        // Match Query { ... } and Mutation { ... } blocks
+        // Outer regex: captures the operation type (Query/Mutation/Subscription) and
+        // the entire body of the type block.  RegexOptions.Singleline is required so
+        // '.' matches newlines inside the block body.
         foreach (Match block in Regex.Matches(content,
             @"(?:type|extend\s+type)\s+(Query|Mutation|Subscription)\s*(?:implements[^{]*)?\{([^}]+)\}",
             RegexOptions.Singleline | RegexOptions.IgnoreCase))
@@ -152,7 +214,8 @@ public class SwaggerAnalyzer
                 _              => "QUERY"
             };
 
-            // Each field inside: fieldName(args): ReturnType
+            // Inner regex: each field inside the block — fieldName(args): ReturnType.
+            // Group 1 = field name, Group 2 = return type (may include ! and []).
             foreach (Match field in Regex.Matches(block.Groups[2].Value,
                 @"(\w+)\s*(?:\([^)]*\))?\s*:\s*([\w!\[\]]+)"))
             {
@@ -174,14 +237,27 @@ public class SwaggerAnalyzer
 
     // ── gRPC Proto Parser ─────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Extracts RPC method definitions from a Protocol Buffer (.proto) file and returns
+    /// them as synthetic <see cref="ApiEndpoint"/> objects.
+    /// </summary>
+    /// <param name="file">The .proto file to parse.</param>
+    /// <returns>One <see cref="ApiEndpoint"/> per discovered RPC method.</returns>
+    /// <remarks>
+    /// The service-block regex allows one level of nested braces so that rpc option blocks
+    /// such as <c>option (google.api.http) = { get: "/v1/..." };</c> do not prematurely
+    /// close the service capture group (code-review issue #4).  Streaming RPCs are
+    /// identified by the presence of the <c>stream</c> keyword in request or response types.
+    /// </remarks>
     private static List<ApiEndpoint> ParseProtoFile(FileNode file)
     {
         var endpoints = new List<ApiEndpoint>();
         var content = File.ReadAllText(file.AbsolutePath);
 
-        // service\s+Name\s+{ … } — allow one level of nested braces so rpc option
-        // blocks (which contain { option ... = { ... }; }) don't prematurely close the
-        // service capture group (code-review issue #4, regex fix).
+        // service\s+Name\s+{ … } — the inner group ((?:[^{}]|\{[^{}]*\})*) matches:
+        //   [^{}]          plain content (no braces)
+        //   \{[^{}]*\}     a single level of nested braces (e.g. option { ... })
+        // This prevents option blocks with their own braces from breaking the outer match.
         foreach (Match svc in Regex.Matches(content,
             @"service\s+(\w+)\s*\{((?:[^{}]|\{[^{}]*\})*)\}", RegexOptions.Singleline))
         {
@@ -192,6 +268,7 @@ public class SwaggerAnalyzer
                 var methodName = rpc.Groups[1].Value;
                 var requestType = rpc.Groups[2].Value.Trim();
                 var responseType = rpc.Groups[3].Value.Trim();
+                // Detect server/client/bidirectional streaming by the "stream" keyword prefix.
                 var isStreaming = requestType.StartsWith("stream ") || responseType.StartsWith("stream ");
                 endpoints.Add(new ApiEndpoint
                 {
