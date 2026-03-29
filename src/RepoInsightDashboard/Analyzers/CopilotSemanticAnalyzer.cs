@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -15,17 +16,93 @@ public class CopilotSemanticAnalyzer
 
     private readonly HttpClient _http;
     private readonly string? _token;
+    private readonly string _model;
+
+    /// <summary>The Copilot chat-completions endpoint (same for all supported models).</summary>
     private const string CopilotEndpoint = "https://api.githubcopilot.com/chat/completions";
+
+    /// <summary>
+    /// Fallback model name used when <c>COPILOT_MODEL</c> environment variable is absent or whitespace.
+    /// Defined as a constant so every reference stays in sync.
+    /// </summary>
+    private const string DefaultModel = "gpt-4o";
+
+    // Using int (not bool) so Interlocked.Exchange can atomically guarantee the warning fires
+    // exactly once even when multiple CallCopilotAsync tasks run concurrently.
+    // 0 = not shown, 1 = shown.
+    private static int _uploadWarningShown;
+
+    // ── Static readonly regexes — compiled ONCE per process lifetime ──────────
+    // RegexOptions.Compiled emits CIL bytecode; paying that cost inside a hot loop
+    // (once per source file × up to 200 files) is wasteful. Hoisting to static fields
+    // amortises the compilation cost to a one-time startup expense. (P1 perf fix)
+
+    /// <summary>Detects hardcoded passwords, API keys, and other secrets in source code.</summary>
+    private static readonly Regex SecretPattern = new(
+        @"(?i)(password|passwd|secret|api_key|apikey|private_key|access_token|auth_token|client_secret)\s*[=:]\s*[""'][^""'\s]{6,}[""']",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    /// <summary>Detects SQL queries built by string concatenation or format calls.</summary>
+    private static readonly Regex SqlConcatPattern = new(
+        @"(?i)(select|insert|update|delete|where|from)\s+.{0,60}(\+|string\.Format|String\.format|sprintf|fmt\.Sprintf)\s*",
+        RegexOptions.Compiled);
+
+    /// <summary>Detects disabled TLS/SSL certificate validation.</summary>
+    private static readonly Regex InsecureTlsPattern = new(
+        @"(?i)(ServerCertificateValidationCallback\s*=.*true|InsecureSkipVerify\s*:\s*true|verify\s*=\s*false|ssl_verify\s*=\s*false|CURLOPT_SSL_VERIFYPEER)",
+        RegexOptions.Compiled);
+
+    /// <summary>Detects use of deprecated weak cryptographic algorithms (MD5, SHA-1, DES, …).</summary>
+    private static readonly Regex WeakCryptoPattern = new(
+        @"(?i)(MD5\.Create|SHA1\.Create|new\s+MD5|new\s+SHA1|hashlib\.md5|hashlib\.sha1|DES\.|TripleDES\.|RC2\.|['""]md5['""]|['""]sha1['""])",
+        RegexOptions.Compiled);
+
+    /// <summary>Detects debug/actuator endpoints or developer-exception-page middleware.</summary>
+    private static readonly Regex DebugEndpointPattern = new(
+        @"(?i)(\/debug|\/actuator|app\.UseDeveloperExceptionPage|DEBUG\s*=\s*true|\.UseSwagger\(\))",
+        RegexOptions.Compiled);
+
+    /// <summary>Detects calls to shell/OS command execution functions.</summary>
+    private static readonly Regex CommandInjectionPattern = new(
+        @"(?i)(Process\.Start|os\.system\(|exec\(|shell_exec\(|popen\(|Runtime\.getRuntime\(\)\.exec|os\.exec\.Command)",
+        RegexOptions.Compiled);
+
+    /// <summary>Detects unsafe deserialisation patterns (TypeNameHandling, BinaryFormatter, pickle …).</summary>
+    private static readonly Regex InsecureDeserPattern = new(
+        @"(?i)(JsonConvert\.DeserializeObject.*TypeNameHandling|BinaryFormatter|ObjectInputStream|pickle\.loads|yaml\.load\((?!.*Loader))",
+        RegexOptions.Compiled);
 
     public bool IsAvailable => !string.IsNullOrEmpty(_token);
 
+    /// <summary>
+    /// Initialises the analyser.
+    /// </summary>
+    /// <param name="copilotToken">
+    /// Explicit token supplied via <c>--copilot-token</c> CLI flag.
+    /// An empty string is treated the same as <c>null</c> so the env-var fallback fires.
+    /// When absent, falls back to the <c>GITHUB_COPILOT_TOKEN</c> environment variable
+    /// (which may have been loaded from a <c>.env</c> file by <see cref="Services.DotEnvLoader"/>).
+    /// </param>
     public CopilotSemanticAnalyzer(string? copilotToken = null)
     {
         // Only accept the Copilot-specific token, never the broad GITHUB_TOKEN (CWE-522).
         // GITHUB_TOKEN in CI carries repo write access; using it as a Copilot credential
         // would silently send source code to an external API with an overprivileged token.
-        _token = copilotToken ?? Environment.GetEnvironmentVariable("GITHUB_COPILOT_TOKEN");
-        _http  = _sharedHttp;
+        //
+        // IsNullOrEmpty (not ??) so that an empty-string CLI arg ("--copilot-token """)
+        // falls through to the env-var lookup rather than storing "" and disabling AI.
+        _token = string.IsNullOrEmpty(copilotToken)
+            ? Environment.GetEnvironmentVariable("GITHUB_COPILOT_TOKEN")
+            : copilotToken;
+
+        // Read the model name from the environment so users can override via .env or OS export.
+        // Example: COPILOT_MODEL=gpt-4o-mini rid analyze ./myrepo
+        // IsNullOrWhiteSpace guard prevents a whitespace-only value from reaching the API
+        // and causing a silent HTTP 400/422 that is swallowed by CallCopilotAsync.
+        var rawModel = Environment.GetEnvironmentVariable("COPILOT_MODEL");
+        _model = string.IsNullOrWhiteSpace(rawModel) ? DefaultModel : rawModel.Trim();
+
+        _http = _sharedHttp;
     }
 
     public async Task<string?> GenerateProjectSummaryAsync(DashboardData data, CancellationToken ct = default)
@@ -83,17 +160,23 @@ public class CopilotSemanticAnalyzer
         string? repoPath = null,
         CancellationToken ct = default)
     {
-        // Always run local static analysis
+        // Always run local static analysis first.
         var risks = DetectSecurityRisksLocally(data, allFiles, repoPath);
 
-        // AI deep scan when token is available
+        // AI deep scan when token is available.
         if (IsAvailable && allFiles != null)
         {
+            // Build an O(1) lookup from already-known local risks BEFORE the loop.
+            // This turns the deduplication from O(n²) → O(n): no per-element linear scan.
+            var existingKeys = risks
+                .Select(r => (r.Title, r.FilePath))
+                .ToHashSet();
+
             var aiRisks = await AnalyzeCodeSecurityWithAIAsync(data, allFiles, ct);
             foreach (var r in aiRisks)
             {
-                // Deduplicate by title + file
-                if (!risks.Any(x => x.Title == r.Title && x.FilePath == r.FilePath))
+                // HashSet.Add returns false on duplicate — single O(1) check per item.
+                if (existingKeys.Add((r.Title, r.FilePath)))
                     risks.Add(r);
             }
         }
@@ -281,51 +364,38 @@ public class CopilotSemanticAnalyzer
                 && f.SizeBytes < 500_000)
             .ToList();
 
-        var hardcodedSecretFiles = new List<string>();
-        var sqlInjectionFiles = new List<string>();
-        var insecureTlsFiles = new List<string>();
-        var weakCryptoFiles = new List<string>();
-        var debugEndpointFiles = new List<string>();
+        var hardcodedSecretFiles  = new List<string>();
+        var sqlInjectionFiles     = new List<string>();
+        var insecureTlsFiles      = new List<string>();
+        var weakCryptoFiles       = new List<string>();
+        var debugEndpointFiles    = new List<string>();
         var commandInjectionFiles = new List<string>();
-        var insecureDeserFiles = new List<string>();
+        var insecureDeserFiles    = new List<string>();
 
-        // Regex patterns for common security issues
-        var secretPattern = new Regex(
-            @"(?i)(password|passwd|secret|api_key|apikey|private_key|access_token|auth_token|client_secret)\s*[=:]\s*[""'][^""'\s]{6,}[""']",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        var sqlConcatPattern = new Regex(
-            @"(?i)(select|insert|update|delete|where|from)\s+.{0,60}(\+|string\.Format|String\.format|sprintf|fmt\.Sprintf)\s*",
-            RegexOptions.Compiled);
-        var insecureTlsPattern = new Regex(
-            @"(?i)(ServerCertificateValidationCallback\s*=.*true|InsecureSkipVerify\s*:\s*true|verify\s*=\s*false|ssl_verify\s*=\s*false|CURLOPT_SSL_VERIFYPEER)",
-            RegexOptions.Compiled);
-        var weakCryptoPattern = new Regex(
-            @"(?i)(MD5\.Create|SHA1\.Create|new\s+MD5|new\s+SHA1|hashlib\.md5|hashlib\.sha1|DES\.|TripleDES\.|RC2\.|['""]md5['""]|['""]sha1['""])",
-            RegexOptions.Compiled);
-        var debugEndpointPattern = new Regex(
-            @"(?i)(\/debug|\/actuator|app\.UseDeveloperExceptionPage|DEBUG\s*=\s*true|\.UseSwagger\(\))",
-            RegexOptions.Compiled);
-        var commandInjectionPattern = new Regex(
-            @"(?i)(Process\.Start|os\.system\(|exec\(|shell_exec\(|popen\(|Runtime\.getRuntime\(\)\.exec|os\.exec\.Command)",
-            RegexOptions.Compiled);
-        var insecureDeserPattern = new Regex(
-            @"(?i)(JsonConvert\.DeserializeObject.*TypeNameHandling|BinaryFormatter|ObjectInputStream|pickle\.loads|yaml\.load\((?!.*Loader))",
-            RegexOptions.Compiled);
-
+        // Use the class-level static readonly regex fields (defined at the top of this class).
+        // They are compiled ONCE per process lifetime; instantiating inside the loop
+        // would pay the expensive Regex compilation cost once per call (P1 perf fix).
         foreach (var file in sourceFiles.Take(200))
         {
             try
             {
                 var content = File.ReadAllText(file.AbsolutePath);
-                if (secretPattern.IsMatch(content)) hardcodedSecretFiles.Add(file.RelativePath);
-                if (sqlConcatPattern.IsMatch(content)) sqlInjectionFiles.Add(file.RelativePath);
-                if (insecureTlsPattern.IsMatch(content)) insecureTlsFiles.Add(file.RelativePath);
-                if (weakCryptoPattern.IsMatch(content)) weakCryptoFiles.Add(file.RelativePath);
-                if (debugEndpointPattern.IsMatch(content)) debugEndpointFiles.Add(file.RelativePath);
-                if (commandInjectionPattern.IsMatch(content)) commandInjectionFiles.Add(file.RelativePath);
-                if (insecureDeserPattern.IsMatch(content)) insecureDeserFiles.Add(file.RelativePath);
+                if (SecretPattern.IsMatch(content))          hardcodedSecretFiles.Add(file.RelativePath);
+                if (SqlConcatPattern.IsMatch(content))       sqlInjectionFiles.Add(file.RelativePath);
+                if (InsecureTlsPattern.IsMatch(content))     insecureTlsFiles.Add(file.RelativePath);
+                if (WeakCryptoPattern.IsMatch(content))      weakCryptoFiles.Add(file.RelativePath);
+                if (DebugEndpointPattern.IsMatch(content))   debugEndpointFiles.Add(file.RelativePath);
+                if (CommandInjectionPattern.IsMatch(content)) commandInjectionFiles.Add(file.RelativePath);
+                if (InsecureDeserPattern.IsMatch(content))   insecureDeserFiles.Add(file.RelativePath);
             }
-            catch { }
+            catch (OperationCanceledException) { throw; } // Always propagate cancellation.
+            catch (Exception ex)
+            {
+                // Non-critical: a file that can't be read is skipped. Log for debuggability.
+                Debug.WriteLine(
+                    $"[CopilotSemanticAnalyzer] Static scan skipped '{file.RelativePath}': " +
+                    $"{ex.GetType().Name} — {ex.Message}");
+            }
         }
 
         if (hardcodedSecretFiles.Count > 0)
@@ -426,15 +496,25 @@ public class CopilotSemanticAnalyzer
 
     // ─── Copilot API ───────────────────────────────────────────────────────
 
-    private static bool _uploadWarningShown;
+    // Using int so Interlocked.Exchange can operate atomically — plain bool read/write
+    // is not guaranteed atomic by the C# memory model across concurrent async callers.
+    // 0 = warning not yet shown; 1 = warning shown.
+    // Declared here (not at the class top) to stay adjacent to the method that uses it.
+    // Note: the static readonly regex fields and _uploadWarningShown are defined higher in the class.
+
+    // Model allowlist — validated at construction time; unknown values fall back to DefaultModel.
+    // Restricts the model sent to the API to values we know the Copilot endpoint accepts (CWE-20).
+    private static readonly HashSet<string> KnownModels = new(StringComparer.OrdinalIgnoreCase)
+        { "gpt-4o", "gpt-4o-mini", "gpt-4.1" };
 
     private async Task<string?> CallCopilotAsync(string userPrompt, int maxTokens, CancellationToken ct)
     {
-        // Inform the user exactly once that source code will leave this machine.
-        // CWE-359 / OWASP A04 — never silently exfiltrate data.
-        if (!_uploadWarningShown)
+        // Atomic one-shot: Interlocked.Exchange returns the OLD value.
+        // Only the first caller (old value == 0) enters the warning block.
+        // Concurrent callers from Task.WhenAll see old value == 1 and skip it.
+        // This replaces the previous non-atomic bool check-then-set pattern.
+        if (Interlocked.Exchange(ref _uploadWarningShown, 1) == 0)
         {
-            _uploadWarningShown = true;
             Console.WriteLine();
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine("⚠  [RID] Code snippets will be sent to api.githubcopilot.com for AI analysis.");
@@ -443,9 +523,14 @@ public class CopilotSemanticAnalyzer
             await Task.Delay(5000, ct);
         }
 
+        // Validate model against the allowlist; fall back to DefaultModel on unknown input.
+        // Prevents an injected COPILOT_MODEL value from silently causing API errors (CWE-20).
+        var safeModel = KnownModels.Contains(_model) ? _model : DefaultModel;
+
         var payload = new
         {
-            model = "gpt-4o",
+            // safeModel is always a member of KnownModels or DefaultModel.
+            model = safeModel,
             messages = new[]
             {
                 new { role = "system", content = "你是一位資深程式架構分析師與資訊安全專家，專精於繁體中文技術文件撰寫。" },
@@ -466,12 +551,33 @@ public class CopilotSemanticAnalyzer
             request.Headers.Add("Editor-Version", "vscode/1.85.0");
 
             var response = await _http.SendAsync(request, ct);
-            if (!response.IsSuccessStatusCode) return null;
+            if (!response.IsSuccessStatusCode)
+            {
+                // Log HTTP-level failures so auth/TLS errors are not silently swallowed (CWE-390).
+                Debug.WriteLine(
+                    $"[CopilotSemanticAnalyzer] Copilot API returned {(int)response.StatusCode} " +
+                    $"{response.ReasonPhrase} for model='{safeModel}'");
+                return null;
+            }
 
             var json = JObject.Parse(await response.Content.ReadAsStringAsync(ct));
             return json["choices"]?[0]?["message"]?["content"]?.ToString();
         }
-        catch { return null; }
+        catch (OperationCanceledException) { throw; } // Always propagate user Ctrl+C / timeout.
+        catch (HttpRequestException ex)
+        {
+            Debug.WriteLine(
+                $"[CopilotSemanticAnalyzer] HTTP error calling Copilot: " +
+                $"StatusCode={ex.StatusCode}, Message={ex.Message}");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(
+                $"[CopilotSemanticAnalyzer] Unexpected error in CallCopilotAsync: " +
+                $"{ex.GetType().Name} — {ex.Message}");
+            return null;
+        }
     }
 
     // ─── Local Fallbacks ───────────────────────────────────────────────────
@@ -497,13 +603,23 @@ public class CopilotSemanticAnalyzer
         if (data.Containers.Count > 1) patterns.Add("微服務架構");
         if (data.ApiEndpoints.Count > 0) patterns.Add("RESTful API");
         if (data.Containers.Count > 0) patterns.Add("容器化部署");
-        if (data.Packages.Any(p => p.Name.Contains("grpc", StringComparison.OrdinalIgnoreCase)))
-            patterns.Add("gRPC 通訊");
-        if (data.Packages.Any(p => p.Name.Contains("kafka", StringComparison.OrdinalIgnoreCase) ||
-                                   p.Name.Contains("rabbitmq", StringComparison.OrdinalIgnoreCase)))
-            patterns.Add("訊息佇列");
-        if (data.Packages.Any(p => p.Name.Contains("redis", StringComparison.OrdinalIgnoreCase)))
-            patterns.Add("快取層 (Redis)");
+
+        // Single O(P) pass over packages instead of three separate .Any() traversals.
+        // Short-circuits as soon as all three flags are found. (P3 perf fix)
+        bool hasGrpc = false, hasMessageQueue = false, hasRedis = false;
+        foreach (var pkg in data.Packages)
+        {
+            var name = pkg.Name;
+            if (!hasGrpc         && name.Contains("grpc",      StringComparison.OrdinalIgnoreCase)) hasGrpc = true;
+            if (!hasMessageQueue && (name.Contains("kafka",     StringComparison.OrdinalIgnoreCase) ||
+                                     name.Contains("rabbitmq",  StringComparison.OrdinalIgnoreCase))) hasMessageQueue = true;
+            if (!hasRedis        && name.Contains("redis",      StringComparison.OrdinalIgnoreCase)) hasRedis = true;
+            if (hasGrpc && hasMessageQueue && hasRedis) break; // Early exit once all found.
+        }
+        if (hasGrpc)         patterns.Add("gRPC 通訊");
+        if (hasMessageQueue) patterns.Add("訊息佇列");
+        if (hasRedis)        patterns.Add("快取層 (Redis)");
+
         if (data.Project.Languages.Any(l => l.Name is "TypeScript" or "JavaScript") &&
             data.Project.Languages.Any(l => l.Name is "C#" or "Go" or "Java"))
             patterns.Add("前後端分離");
