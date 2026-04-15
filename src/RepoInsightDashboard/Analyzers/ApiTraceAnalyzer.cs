@@ -583,10 +583,15 @@ public class ApiTraceAnalyzer
             }
         }
 
-        // Also check for direct DB/store calls in handler body (no service layer)
+        // Also check for direct DB/store calls in handler body (no service layer detected).
+        // Use CollectGoStoreCalls (not just ExtractGoStoreCalls) so that private helper
+        // methods on the same receiver (e.g. server.donateCodes_List → server.store.Xxx)
+        // defined in the same file are followed recursively, matching Go projects that
+        // embed business logic as unexported *Server methods instead of a separate Service struct.
         if (trace.Steps.Count == 1)
         {
-            foreach (var dbMethod in ExtractGoStoreCalls(handlerBody))
+            var allDbMethods = CollectGoStoreCalls(handlerBody, handlerLines, handlerResult.Value.File);
+            foreach (var dbMethod in allDbMethods)
                 if (_sqlCache.TryGetValue(dbMethod, out var sql))
                     trace.SqlQueries.Add(EnrichSqlQueryFromCallSite(sql, handlerBody));
         }
@@ -668,9 +673,13 @@ public class ApiTraceAnalyzer
             "Commit", "Rollback", "Prepare", "PrepareContext", "Context", "WithTx",
             "Close", "Ping", "Stats"
         };
-        // Match any receiver.store.Method( pattern — covers d.store, s.store, svc.store, etc.
+        // Match receiver.storeField.Method( — covers naming variants: server.store, d.db, s.db_store, r.repo
+        // \w*store  → matches store, db_store, my_store
+        // \w*db     → matches db, my_db
+        // \w*repo   → matches repo, my_repo
+        // \w*quer   → matches query, queries
         var matches = Regex.Matches(body,
-            @"(?:\w+\.store|\bstore\b|\bq\b|\bdb\b|\w+\.db)\s*\.\s*([A-Z]\w+)\s*\(");
+            @"(?:\w+\.\w*store|\bstore\b|\bq\b|\bdb\b|\w+\.\w*db|\w+\.\w*repo|\w+\.\w*quer)\s*\.\s*([A-Z]\w+)\s*\(");
         return matches.Cast<Match>()
             .Select(m => m.Groups[1].Value)
             .Where(n => !excludes.Contains(n))
@@ -831,7 +840,25 @@ public class ApiTraceAnalyzer
                     break;
                 }
             }
-            if (helperLine < 0) continue;
+            if (helperLine < 0)
+            {
+                // Cross-file lookup: helper is defined in a different source file.
+                // Use _funcIndex (built from all project files) to locate it.
+                if (!_funcIndex.TryGetValue(helperName, out var locations)) continue;
+                foreach (var (xFile, xLine) in locations)
+                {
+                    if (xFile.Extension != ".go" || IsTestFile(xFile) || IsGeneratedFile(xFile)) continue;
+                    try
+                    {
+                        var crossLines = File.ReadAllLines(xFile.AbsolutePath);
+                        var (crossBody, _, _) = ExtractFunctionBodyWithLines(crossLines, helperName, xLine);
+                        CollectStoreCallsRecursive(crossBody, crossLines, depth - 1, collected, visited);
+                    }
+                    catch { }
+                    break; // use first match
+                }
+                continue;
+            }
 
             var (helperBody, _, _) = ExtractFunctionBodyWithLines(allLines, helperName, helperLine);
             CollectStoreCallsRecursive(helperBody, allLines, depth - 1, collected, visited);
@@ -1866,9 +1893,11 @@ public class ApiTraceAnalyzer
             }
         }
 
-        // Find opening { or : (Python)
+        // Find opening { or : (Python).
+        // Use a window of 15 lines to handle functions with long parameter lists
+        // (e.g. 5+ named parameters, each on its own line) without missing the opening brace.
         int braceStart = funcStart;
-        for (int i = funcStart; i < Math.Min(funcStart + 5, lines.Length); i++)
+        for (int i = funcStart; i < Math.Min(funcStart + 15, lines.Length); i++)
         {
             if (lines[i].Contains('{') || lines[i].TrimEnd().EndsWith(':'))
             { braceStart = i; break; }
