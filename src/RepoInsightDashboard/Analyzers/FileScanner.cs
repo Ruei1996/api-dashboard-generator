@@ -43,7 +43,8 @@ public class FileScanner
     // These are files the rid tool specifically needs to function correctly.
     private static readonly HashSet<string> ForceInclude = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".env", "service.swagger.json", "copilot-instructions.md"
+        ".env", "service.swagger.json", "copilot-instructions.md",
+        "Makefile", "GNUmakefile", "makefile"
     };
 
     // Maximum directory depth to recurse into.
@@ -119,9 +120,14 @@ public class FileScanner
                     if (target != null)
                     {
                         var resolved = Path.GetFullPath(target.FullName);
-                        // StringComparison.Ordinal is intentional: path comparison must be
-                        // byte-exact to prevent case-folding or Unicode normalisation tricks.
-                        if (!resolved.StartsWith(basePath, StringComparison.Ordinal))
+                        // Ensure the trailing separator is present before the prefix check.
+                        // Without it, "/repo-name-evil".StartsWith("/repo-name") would be true,
+                        // allowing a symlink to a sibling directory to escape the repo root guard.
+                        // StringComparison.Ordinal is intentional: byte-exact to prevent
+                        // case-folding or Unicode normalisation tricks.
+                        var safeBase = basePath.TrimEnd(Path.DirectorySeparatorChar)
+                                      + Path.DirectorySeparatorChar;
+                        if (!resolved.StartsWith(safeBase, StringComparison.Ordinal))
                             continue; // Target escapes repo root — skip entirely.
                     }
                 }
@@ -170,12 +176,13 @@ public class FileScanner
                 allFiles.Add(fileNode);
             }
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // IOException is intentionally broad here — it covers UnauthorizedAccessException
-            // (permission-denied directories), DirectoryNotFoundException (race-deleted dirs),
-            // and network path errors.  All of these are non-fatal: we skip the unreadable
-            // directory and continue scanning the rest of the tree.
+            // IOException:               DirectoryNotFoundException, network path errors, race-deleted dirs.
+            // UnauthorizedAccessException: permission-denied directories.
+            // NOTE: UnauthorizedAccessException does NOT derive from IOException in .NET —
+            //       both derive independently from SystemException — so both must be caught explicitly.
+            // All of these are non-fatal: skip the unreadable entry and continue scanning.
         }
     }
 

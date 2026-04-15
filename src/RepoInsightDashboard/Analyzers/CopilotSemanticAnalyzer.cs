@@ -134,6 +134,17 @@ public class CopilotSemanticAnalyzer
         _http = _sharedHttp;
     }
 
+    /// <summary>
+    /// Generates a human-readable project summary using the Copilot API when a token is
+    /// configured, or falls back to a locally-templated string when <see cref="IsAvailable"/> is <c>false</c>.
+    /// </summary>
+    /// <param name="data">Fully-populated dashboard data used to build the prompt context.</param>
+    /// <param name="ct">Cancellation token propagated to the Copilot HTTP call.</param>
+    /// <returns>
+    /// A Markdown-compatible summary string (200 words or fewer in Traditional Chinese),
+    /// or the local fallback summary when no Copilot token is configured.
+    /// Returns <c>null</c> only if both the API call and local generation unexpectedly fail.
+    /// </returns>
     public async Task<string?> GenerateProjectSummaryAsync(DashboardData data, CancellationToken ct = default)
     {
         if (!IsAvailable) return GenerateLocalSummary(data);
@@ -152,6 +163,22 @@ public class CopilotSemanticAnalyzer
         return await CallCopilotAsync(prompt, 400, ct);
     }
 
+    /// <summary>
+    /// Detects architectural design patterns from package names and project structure,
+    /// using the Copilot API when available or a local heuristic O(P) scan as fallback.
+    /// </summary>
+    /// <param name="data">Fully-populated dashboard data used to build the prompt context.</param>
+    /// <param name="ct">Cancellation token propagated to the Copilot HTTP call.</param>
+    /// <returns>
+    /// List of detected pattern names in Traditional Chinese (e.g. "微服務架構", "RESTful API",
+    /// "容器化部署", "gRPC 通訊").  Returns an empty list if the AI call fails and no patterns
+    /// are matched by the local heuristics.
+    /// </returns>
+    /// <remarks>
+    /// When the AI path is taken, the model response must be a valid JSON array of strings.
+    /// The parser extracts the first <c>[…]</c> substring from the raw response to be
+    /// resilient against model preamble text that precedes the JSON.
+    /// </remarks>
     public async Task<List<string>> DetectDesignPatternsAsync(DashboardData data, CancellationToken ct = default)
     {
         if (!IsAvailable) return DetectPatternsLocally(data);
@@ -410,7 +437,7 @@ public class CopilotSemanticAnalyzer
 
         // ── Exposed secrets (env var with real values) ───────────────────
         var exposedSecrets = data.EnvVariables
-            .Where(e => e.IsSensitive && !string.IsNullOrEmpty(e.Value) && e.Value != "***"
+            .Where(e => e.IsSensitive && !string.IsNullOrEmpty(e.Value) && e.Value != "***masked***"
                         && e.Value.Length > 5)
             .Take(5).Select(e => e.Key).ToList();
         if (exposedSecrets.Count > 0)

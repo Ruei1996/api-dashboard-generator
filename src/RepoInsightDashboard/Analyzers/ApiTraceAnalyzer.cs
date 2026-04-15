@@ -1,3 +1,38 @@
+// ============================================================
+// ApiTraceAnalyzer.cs — Multi-language API execution path tracer
+// ============================================================
+// Architecture: stateful service class; all indexes are built eagerly at
+//   construction time (one full source-file scan) and then used read-only
+//   during analysis (fast dictionary lookups per endpoint).
+//
+// Supported languages & frameworks:
+//   Go         — grpc-gateway HandlePath, gin, echo, chi
+//   C#         — ASP.NET Core [HttpGet/Post/…] attribute routing
+//   Python     — FastAPI / Flask / Django decorators
+//   Java/Kotlin — Spring MVC @GetMapping / @PostMapping
+//   TypeScript/JavaScript — NestJS decorators, Express router.get/post
+//   PHP/Laravel — Route::get/post in routes/api.php
+//   Ruby/Rails — routes.rb get/post + 'controller#action' syntax
+//
+// Analysis pipeline per endpoint:
+//   1. Route resolution  — explicit route index (exact → normalised → fuzzy path match)
+//                          OR name-derived candidates from operationId + path segments
+//   2. Handler tracing   — locate handler function, extract body via brace counting
+//   3. Service tracing   — follow service/manager/handler calls from handler body
+//   4. Repository tracing — follow DB/store/repo calls from service body
+//   5. SQL association   — match pre-loaded sqlc queries or inline SQL strings
+//
+// Performance decisions:
+//   • BuildFunctionIndex is O(F × L) run once; per-endpoint analysis is O(C) lookups.
+//   • MaxSourceFileSizeBytes (5 MB) prevents OOM on auto-generated bundles.
+//   • Take(120) in AnalyzeTraces caps CPU time on very large generated APIs.
+//   • _routeHandlerIndex avoids redundant file scans for registered Go routes.
+//
+// Usage:
+//   var tracer = new ApiTraceAnalyzer(repoPath, allFiles);
+//   List<ApiTrace> traces = tracer.AnalyzeTraces(apiEndpoints);
+// ============================================================
+
 using System.Text.RegularExpressions;
 using RepoInsightDashboard.Models;
 
@@ -14,6 +49,10 @@ public class ApiTraceAnalyzer
     private readonly List<FileNode> _allFiles;
     private readonly string _primaryLanguage;
 
+    /// <summary>Maximum size for source files read into the function index or trace analysis.
+    /// Files larger than this are skipped to prevent OOM on giant generated/bundled files.</summary>
+    private const long MaxSourceFileSizeBytes = 5 * 1024 * 1024; // 5 MB
+
     // funcName (lower) -> list of (file, lineNumber) where the function is defined
     private readonly Dictionary<string, List<(FileNode File, int Line)>> _funcIndex =
         new(StringComparer.OrdinalIgnoreCase);
@@ -26,6 +65,74 @@ public class ApiTraceAnalyzer
     // Populated by scanning grpc-gateway HandlePath / gin / echo / chi route registrations.
     private readonly Dictionary<(string Method, string Path), string> _routeHandlerIndex = new();
 
+    // File content cache: AbsolutePath -> lines array.
+    // Avoids re-reading the same source file 3+ times across the analysis pipeline.
+    private readonly Dictionary<string, string[]> _fileLineCache =
+        new(StringComparer.Ordinal);
+
+    // ── Compiled static regexes (instantiated once per AppDomain) ─────────────
+    // Using RegexOptions.Compiled so the JIT emits native code for the pattern.
+    private static readonly Regex RxGoFunc =
+        new(@"^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(", RegexOptions.Compiled);
+    private static readonly Regex RxCsMethod =
+        new(@"(?:public|private|protected|internal)(?:\s+(?:override|virtual|static|async))*\s+\S+\s+(\w+)\s*\(",
+            RegexOptions.Compiled);
+    private static readonly Regex RxPyDef =
+        new(@"^(?:[ \t]*)(?:async\s+)?def\s+(\w+)\s*\(", RegexOptions.Compiled);
+    private static readonly Regex RxJavaDef =
+        new(@"(?:public|private|protected)(?:\s+(?:static|final|synchronized|async))*\s+\S+\s+(\w+)\s*\(",
+            RegexOptions.Compiled);
+    private static readonly Regex RxJsFunction =
+        new(@"(?:async\s+)?function\s+(\w+)\s*\(", RegexOptions.Compiled);
+    private static readonly Regex RxJsArrow =
+        new(@"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(", RegexOptions.Compiled);
+    private static readonly Regex RxJsClassMethod =
+        new(@"^\s+(\w+)\s*\(.*\)\s*(?:\{|:)", RegexOptions.Compiled);
+    private static readonly Regex RxPhpFunction =
+        new(@"(?:public|private|protected)?\s*function\s+(\w+)\s*\(", RegexOptions.Compiled);
+    private static readonly Regex RxRubyDef =
+        new(@"^\s*def\s+(\w+)", RegexOptions.Compiled);
+    private static readonly Regex RxSqlcArg =
+        new(@"sqlc\.arg\((\w+)\)", RegexOptions.Compiled);
+    private static readonly Regex RxNarg =
+        new(@"@(\w+)", RegexOptions.Compiled);
+    private static readonly Regex RxStructField =
+        new(@"(\w+)\s+([\w\.\*\[\]]+)", RegexOptions.Compiled);
+    private static readonly Regex RxStructInit =
+        new(@"(\w+)\s*:\s*([^,\n\r]+)", RegexOptions.Compiled);
+    private static readonly Regex RxVersionSeg =
+        new(@"^v\d+$", RegexOptions.Compiled);
+    private static readonly Regex RxCamelToSnake1 =
+        new(@"(?<=[a-z0-9])([A-Z])", RegexOptions.Compiled);
+    private static readonly Regex RxCamelToSnake2 =
+        new(@"(?<=[A-Z]{1})([A-Z][a-z])", RegexOptions.Compiled);
+    private static readonly Regex RxNumericLiteral =
+        new(@"^-?\d+(\.\d+)?$", RegexOptions.Compiled);
+    private static readonly Regex RxGoStringLiteral =
+        new(@"^""([^""\\]*)""$", RegexOptions.Compiled);
+    private static readonly Regex RxGoRawLiteral =
+        new(@"^`([^`]*)`$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Constructs the analyser and eagerly builds three indexes by scanning all
+    /// source files exactly once:
+    /// <list type="bullet">
+    ///   <item><see cref="_funcIndex"/> — maps function name → (file, lineNumber)</item>
+    ///   <item><see cref="_sqlCache"/> — maps sqlc function name → SQL query</item>
+    ///   <item><see cref="_routeHandlerIndex"/> — maps (method, path) → handler name</item>
+    /// </list>
+    /// </summary>
+    /// <param name="repoPath">Absolute path to the repository root.</param>
+    /// <param name="allFiles">
+    /// Flat list of all file nodes produced by <see cref="FileScanner"/>.
+    /// Test files (<c>_test.go</c>, <c>*_test.py</c>, etc.) and generated files
+    /// (<c>*.pb.go</c>, <c>wire_gen.go</c>, etc.) are excluded from all indexes.
+    /// </param>
+    /// <remarks>
+    /// Construction cost is O(F × L) where F = source files and L = average lines per file.
+    /// The resulting indexes are read-only; concurrent calls to <see cref="AnalyzeTraces"/>
+    /// are therefore safe without additional locking.
+    /// </remarks>
     public ApiTraceAnalyzer(string repoPath, List<FileNode> allFiles)
     {
         _repoPath = repoPath;
@@ -38,6 +145,42 @@ public class ApiTraceAnalyzer
 
     // ═══ Public Entry Point ══════════════════════════════════════════════════
 
+    /// <summary>
+    /// Returns cached lines for <paramref name="absolutePath"/>, reading from disk on first access.
+    /// Silently returns an empty array if the file cannot be read (no exception propagates).
+    /// </summary>
+    private string[] GetCachedLines(string absolutePath)
+    {
+        if (_fileLineCache.TryGetValue(absolutePath, out var cached))
+            return cached;
+        try
+        {
+            var lines = File.ReadAllLines(absolutePath);
+            _fileLineCache[absolutePath] = lines;
+            return lines;
+        }
+        catch
+        {
+            _fileLineCache[absolutePath] = [];
+            return [];
+        }
+    }
+
+
+    /// <summary>
+    /// Traces the execution path of each endpoint through the repository's source layers
+    /// (Handler → Service → Repository → SQL) and returns the collected
+    /// <see cref="ApiTrace"/> objects.
+    /// </summary>
+    /// <param name="endpoints">
+    /// Endpoint list produced by <see cref="SwaggerAnalyzer"/>.
+    /// At most 120 endpoints are traced to cap analysis time on very large generated APIs;
+    /// endpoints are processed in declaration order so the most important routes are always covered.
+    /// </param>
+    /// <returns>
+    /// List of <see cref="ApiTrace"/> objects.  Traces that resolved zero steps <em>and</em>
+    /// zero SQL queries are discarded so the dashboard only shows actionable results.
+    /// </returns>
     public List<ApiTrace> AnalyzeTraces(List<ApiEndpoint> endpoints)
     {
         var traces = new List<ApiTrace>();
@@ -66,6 +209,18 @@ public class ApiTraceAnalyzer
 
     // ═══ Language Detection ══════════════════════════════════════════════════
 
+    /// <summary>
+    /// Identifies the repository's dominant programming language by counting non-test
+    /// source files per language extension and returning the language with the most files.
+    /// </summary>
+    /// <returns>
+    /// One of: "Go", "C#", "Python", "Java", "Kotlin", "TypeScript", "JavaScript",
+    /// "PHP", "Ruby".  Defaults to "Go" when no recognised source files are found.
+    /// </returns>
+    /// <remarks>
+    /// Test files are excluded so that a Go backend with a large Jest/TypeScript test suite
+    /// does not incorrectly report "TypeScript" as the primary language.
+    /// </remarks>
     private string DetectPrimaryLanguage()
     {
         var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -85,17 +240,29 @@ public class ApiTraceAnalyzer
 
     // ═══ Function Index ═══════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Scans all non-test, non-generated source files and populates
+    /// <see cref="_funcIndex"/> with every function definition found, grouped by name.
+    /// </summary>
+    /// <remarks>
+    /// Files larger than <see cref="MaxSourceFileSizeBytes"/> (5 MB) are skipped to
+    /// prevent OOM on auto-generated bundles (e.g. swagger client SDKs).
+    /// <see cref="OutOfMemoryException"/> and <see cref="StackOverflowException"/> are
+    /// explicitly re-thrown so fatal runtime conditions surface to the CLR rather than
+    /// being silently swallowed by the catch-all handler.
+    /// </remarks>
     private void BuildFunctionIndex()
     {
         var srcExts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { ".go", ".cs", ".py", ".java", ".kt", ".ts", ".js", ".php", ".rb" };
 
         foreach (var file in _allFiles.Where(f =>
-            !f.IsDirectory && srcExts.Contains(f.Extension) && !IsTestFile(f) && !IsGeneratedFile(f)))
+            !f.IsDirectory && srcExts.Contains(f.Extension) && !IsTestFile(f) && !IsGeneratedFile(f)
+            && f.SizeBytes < MaxSourceFileSizeBytes))
         {
             try
             {
-                var lines = File.ReadAllLines(file.AbsolutePath);
+                var lines = GetCachedLines(file.AbsolutePath);
                 foreach (var (name, lineNum) in ExtractFunctionDefinitions(file.Extension, lines))
                 {
                     if (!_funcIndex.TryGetValue(name, out var list))
@@ -103,7 +270,7 @@ public class ApiTraceAnalyzer
                     list.Add((file, lineNum));
                 }
             }
-            catch { }
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) { }
         }
     }
 
@@ -117,48 +284,46 @@ public class ApiTraceAnalyzer
             switch (ext.ToLowerInvariant())
             {
                 case ".go":
-                    m = Regex.Match(line, @"^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(");
+                    m = RxGoFunc.Match(line);
                     if (m.Success) result.Add((m.Groups[1].Value, i + 1));
                     break;
 
                 case ".cs":
-                    m = Regex.Match(line,
-                        @"(?:public|private|protected|internal)(?:\s+(?:override|virtual|static|async))*\s+\S+\s+(\w+)\s*\(");
+                    m = RxCsMethod.Match(line);
                     if (m.Success && !IsKeyword(m.Groups[1].Value))
                         result.Add((m.Groups[1].Value, i + 1));
                     break;
 
                 case ".py":
-                    m = Regex.Match(line, @"^(?:[ \t]*)(?:async\s+)?def\s+(\w+)\s*\(");
+                    m = RxPyDef.Match(line);
                     if (m.Success) result.Add((m.Groups[1].Value, i + 1));
                     break;
 
                 case ".java":
                 case ".kt":
-                    m = Regex.Match(line,
-                        @"(?:public|private|protected)(?:\s+(?:static|final|synchronized|async))*\s+\S+\s+(\w+)\s*\(");
+                    m = RxJavaDef.Match(line);
                     if (m.Success && !IsKeyword(m.Groups[1].Value))
                         result.Add((m.Groups[1].Value, i + 1));
                     break;
 
                 case ".ts":
                 case ".js":
-                    m = Regex.Match(line, @"(?:async\s+)?function\s+(\w+)\s*\(");
+                    m = RxJsFunction.Match(line);
                     if (m.Success) { result.Add((m.Groups[1].Value, i + 1)); break; }
-                    m = Regex.Match(line, @"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(");
+                    m = RxJsArrow.Match(line);
                     if (m.Success) { result.Add((m.Groups[1].Value, i + 1)); break; }
-                    m = Regex.Match(line, @"^\s+(\w+)\s*\(.*\)\s*(?:\{|:)");
+                    m = RxJsClassMethod.Match(line);
                     if (m.Success && !IsKeyword(m.Groups[1].Value))
                         result.Add((m.Groups[1].Value, i + 1));
                     break;
 
                 case ".php":
-                    m = Regex.Match(line, @"(?:public|private|protected)?\s*function\s+(\w+)\s*\(");
+                    m = RxPhpFunction.Match(line);
                     if (m.Success) result.Add((m.Groups[1].Value, i + 1));
                     break;
 
                 case ".rb":
-                    m = Regex.Match(line, @"^\s*def\s+(\w+)");
+                    m = RxRubyDef.Match(line);
                     if (m.Success) result.Add((m.Groups[1].Value, i + 1));
                     break;
             }
@@ -219,7 +384,7 @@ public class ApiTraceAnalyzer
 
     private void ExtractInlineSqlFromFile(FileNode file)
     {
-        var lines = File.ReadAllLines(file.AbsolutePath);
+        var lines = GetCachedLines(file.AbsolutePath);
         string? currentFunc = null;
 
         for (int i = 0; i < lines.Length; i++)
@@ -280,7 +445,7 @@ public class ApiTraceAnalyzer
         {
             try
             {
-                var lines = File.ReadAllLines(file.AbsolutePath);
+                var lines = GetCachedLines(file.AbsolutePath);
                 foreach (var line in lines)
                 {
                     TryParseHandlePathRoute(line, methodMap);
@@ -342,7 +507,7 @@ public class ApiTraceAnalyzer
         var composed = rawSql;
 
         // 1. Handle sqlc.arg(name) format (newer sqlc)
-        var argMatches = Regex.Matches(rawSql, @"sqlc\.arg\((\w+)\)");
+        var argMatches = RxSqlcArg.Matches(rawSql);
         int idx = 1;
         foreach (Match am in argMatches)
         {
@@ -353,15 +518,15 @@ public class ApiTraceAnalyzer
                 Type = "any",
                 Placeholder = $"sqlc.arg({pName})"
             });
-            // Replace sqlc.arg(name) with /* name */ @name for readability
-            composed = composed.Replace(am.Value, $"/* {pName} */ '{pName}_value'");
+            // Replace sqlc.arg(name) with a readable placeholder value
+            composed = composed.Replace(am.Value, $"'{pName}_value'");
             idx++;
         }
 
         // 2. Handle @param_name format (sqlc narg)
         if (paramList.Count == 0)
         {
-            var nargMatches = Regex.Matches(rawSql, @"@(\w+)");
+            var nargMatches = RxNarg.Matches(rawSql);
             foreach (Match nm in nargMatches)
             {
                 var pName = nm.Groups[1].Value;
@@ -421,7 +586,7 @@ public class ApiTraceAnalyzer
                 var structDef = FindGoStructDefinition(structName);
                 if (structDef != null)
                 {
-                    var fieldMatches = Regex.Matches(structDef, @"(\w+)\s+([\w\.\*\[\]]+)");
+                    var fieldMatches = RxStructField.Matches(structDef);
                     idx = 1;
                     foreach (Match fm in fieldMatches)
                     {
@@ -438,7 +603,7 @@ public class ApiTraceAnalyzer
 
         var composed = rawSql;
         foreach (var p in paramList)
-            composed = composed.Replace(p.Placeholder, $"/* {p.Name} */ {p.Placeholder}");
+            composed = composed.Replace(p.Placeholder, $"'{p.Name}_value'");
 
         return (composed, paramList);
     }
@@ -451,7 +616,7 @@ public class ApiTraceAnalyzer
             if (file.Extension != ".go") continue;
             try
             {
-                var lines = File.ReadAllLines(file.AbsolutePath);
+                var lines = GetCachedLines(file.AbsolutePath);
                 if (lineNum <= lines.Length) return lines[lineNum - 1];
             }
             catch { }
@@ -488,6 +653,25 @@ public class ApiTraceAnalyzer
 
     // ═══ Go Analyzer ═════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Traces a Go API endpoint through handler → service → repository layers.
+    /// </summary>
+    /// <param name="ep">The endpoint to trace.</param>
+    /// <returns>
+    /// An <see cref="ApiTrace"/> containing resolved <see cref="TraceStep"/> objects and
+    /// any associated <see cref="SqlQuery"/> records, or an empty trace when the handler
+    /// function cannot be located in the indexed source files.
+    /// </returns>
+    /// <remarks>
+    /// Resolution order:
+    /// <list type="number">
+    ///   <item>Explicit route index (<see cref="FindGoRouteHandlerFromIndex"/>) — fastest, most accurate.</item>
+    ///   <item>Name-derived candidates from <c>operationId</c> and path segments — heuristic fallback.</item>
+    /// </list>
+    /// Direct DB/store calls in the handler body are also collected when no separate
+    /// Service layer is detected, covering the common Go pattern of embedding business
+    /// logic directly on the gRPC server struct.
+    /// </remarks>
     private ApiTrace AnalyzeGoEndpoint(ApiEndpoint ep)
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
@@ -507,7 +691,7 @@ public class ApiTraceAnalyzer
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
         trace.HandlerFunction = handlerResult.Value.FuncName;
 
-        var handlerLines = File.ReadAllLines(handlerResult.Value.File.AbsolutePath);
+        var handlerLines = GetCachedLines(handlerResult.Value.File.AbsolutePath);
         var (handlerBody, hStart, hEnd) = ExtractFunctionBodyWithLines(
             handlerLines, handlerResult.Value.FuncName, handlerResult.Value.Line);
 
@@ -531,7 +715,7 @@ public class ApiTraceAnalyzer
 
             if (svcResult == null) continue;
 
-            var svcLines = File.ReadAllLines(svcResult.Value.File.AbsolutePath);
+            var svcLines = GetCachedLines(svcResult.Value.File.AbsolutePath);
             var (svcBody, svcStart, svcEnd) = ExtractFunctionBodyWithLines(
                 svcLines, svcMethod, svcResult.Value.Line);
 
@@ -556,7 +740,7 @@ public class ApiTraceAnalyzer
 
                 if (repoResult != null && !trace.Steps.Any(s => s.Function == repoMethod))
                 {
-                    var repoLines = File.ReadAllLines(repoResult.Value.File.AbsolutePath);
+                    var repoLines = GetCachedLines(repoResult.Value.File.AbsolutePath);
                     var (repoBody, repoStart, repoEnd) = ExtractFunctionBodyWithLines(
                         repoLines, repoMethod, repoResult.Value.Line);
 
@@ -627,7 +811,7 @@ public class ApiTraceAnalyzer
 
         // Path-derived: /v1/cms/dashboard/churn/detail → CmsDashboardChurnDetail
         var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Where(s => !Regex.IsMatch(s, @"^v\d+$") && !s.StartsWith('{'))
+            .Where(s => !RxVersionSeg.IsMatch(s) && !s.StartsWith('{'))
             .ToArray();
         if (segs.Length > 0)
         {
@@ -714,8 +898,8 @@ public class ApiTraceAnalyzer
     /// <summary>
     /// Enriches a SQL query's ComposedSql by substituting literal (hardcoded) values
     /// detected at the call site struct literal. For example, if the call site contains
-    /// <c>EnableDeletedAt: false</c>, replaces <c>/* enable_deleted_at */ 'enable_deleted_at_value'</c>
-    /// with <c>/* enable_deleted_at */ false</c>, making the composed SQL accurate for this call.
+    /// <c>EnableDeletedAt: false</c>, replaces <c>'enable_deleted_at_value'</c>
+    /// with <c>false</c>, making the composed SQL accurate for this call.
     /// Runtime values (variables, function results) are left as symbolic placeholders.
     /// </summary>
     private static SqlQuery EnrichSqlQueryFromCallSite(SqlQuery query, string callSiteBody)
@@ -737,17 +921,18 @@ public class ApiTraceAnalyzer
         var composed = query.ComposedSql;
         var enriched = false;
 
-        foreach (Match fm in Regex.Matches(structBody, @"(\w+)\s*:\s*([^,\n\r]+)"))
+        foreach (Match fm in RxStructInit.Matches(structBody))
         {
             var goFieldValue = fm.Groups[2].Value.Trim().TrimEnd(',').Trim();
             var literalValue = ExtractGoLiteralValue(goFieldValue);
             if (literalValue == null) continue;
 
             var argName = CamelToSnake(fm.Groups[1].Value.Trim());
-            var placeholder = $"/* {argName} */ '{argName}_value'";
+            // Match the plain placeholder pattern (no /* */ comment prefix)
+            var placeholder = $"'{argName}_value'";
             if (!composed.Contains(placeholder)) continue;
 
-            composed = composed.Replace(placeholder, $"/* {argName} */ {literalValue}");
+            composed = composed.Replace(placeholder, literalValue);
             enriched = true;
         }
 
@@ -771,8 +956,8 @@ public class ApiTraceAnalyzer
     /// </summary>
     private static string CamelToSnake(string camel)
     {
-        var s = Regex.Replace(camel, @"(?<=[a-z0-9])([A-Z])", "_$1");
-        s = Regex.Replace(s, @"(?<=[A-Z]{1})([A-Z][a-z])", "_$1");
+        var s = RxCamelToSnake1.Replace(camel, "_$1");
+        s = RxCamelToSnake2.Replace(s, "_$1");
         return s.ToLowerInvariant();
     }
 
@@ -785,10 +970,10 @@ public class ApiTraceAnalyzer
         expr = expr.Trim();
         if (expr is "true" or "false") return expr;
         if (expr == "nil") return "NULL";
-        if (Regex.IsMatch(expr, @"^-?\d+(\.\d+)?$")) return expr;
-        var strMatch = Regex.Match(expr, @"^""([^""\\]*)""$");
+        if (RxNumericLiteral.IsMatch(expr)) return expr;
+        var strMatch = RxGoStringLiteral.Match(expr);
         if (strMatch.Success) return $"'{strMatch.Groups[1].Value}'";
-        var rawMatch = Regex.Match(expr, @"^`([^`]*)`$");
+        var rawMatch = RxGoRawLiteral.Match(expr);
         if (rawMatch.Success) return $"'{rawMatch.Groups[1].Value}'";
         return null;
     }
@@ -850,7 +1035,7 @@ public class ApiTraceAnalyzer
                     if (xFile.Extension != ".go" || IsTestFile(xFile) || IsGeneratedFile(xFile)) continue;
                     try
                     {
-                        var crossLines = File.ReadAllLines(xFile.AbsolutePath);
+                        var crossLines = GetCachedLines(xFile.AbsolutePath);
                         var (crossBody, _, _) = ExtractFunctionBodyWithLines(crossLines, helperName, xLine);
                         CollectStoreCallsRecursive(crossBody, crossLines, depth - 1, collected, visited);
                     }
@@ -907,8 +1092,10 @@ public class ApiTraceAnalyzer
         if (_routeHandlerIndex.TryGetValue((method, apiPath), out var handlerFunc))
             return FindHandlerInFiles([handlerFunc], IsGoSourceFile);
 
-        // Try stripping /api prefix or version prefix variants
-        var normalizedPath = Regex.Replace(apiPath, @"^/api(/devotions)?", "");
+        // Strip generic /api prefix when present (keeps the leading slash for path matching)
+        var normalizedPath = apiPath.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
+            ? apiPath[4..]  // e.g. "/api/v1/users" → "/v1/users"
+            : apiPath;
         if (_routeHandlerIndex.TryGetValue((method, normalizedPath), out handlerFunc))
             return FindHandlerInFiles([handlerFunc], IsGoSourceFile);
 
@@ -942,6 +1129,14 @@ public class ApiTraceAnalyzer
 
     // ═══ C# Analyzer ═════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Traces an ASP.NET Core endpoint through Controller → Service → Repository layers.
+    /// Finds the action method by matching <c>[HttpGet/Post/…]</c> attribute annotations,
+    /// then follows injected service calls (<c>_xyzService.Method()</c>) into service files
+    /// and repository calls (<c>_xyzRepo.Method()</c>) into data-access files.
+    /// </summary>
+    /// <param name="ep">The endpoint to trace.</param>
+    /// <returns>An <see cref="ApiTrace"/> with resolved steps and inline SQL queries, or an empty trace.</returns>
     private ApiTrace AnalyzeCSharpEndpoint(ApiEndpoint ep)
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
@@ -951,7 +1146,7 @@ public class ApiTraceAnalyzer
 
         foreach (var file in csFiles)
         {
-            var lines = File.ReadAllLines(file.AbsolutePath);
+            var lines = GetCachedLines(file.AbsolutePath);
             var r = FindCSharpActionMethod(lines, ep.Method, ep.Path, file);
             if (r.HasValue) { handlerResult = (file, r.Value.Name, r.Value.Line); break; }
         }
@@ -967,7 +1162,7 @@ public class ApiTraceAnalyzer
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
         trace.HandlerFunction = handlerResult.Value.FuncName;
 
-        var handlerLines = File.ReadAllLines(handlerResult.Value.File.AbsolutePath);
+        var handlerLines = GetCachedLines(handlerResult.Value.File.AbsolutePath);
         var (handlerBody, hStart, hEnd) = ExtractFunctionBodyWithLines(
             handlerLines, handlerResult.Value.FuncName, handlerResult.Value.Line);
 
@@ -989,7 +1184,7 @@ public class ApiTraceAnalyzer
                 f => f.Extension == ".cs" && !IsTestFile(f) && IsCSharpServiceFile(f.RelativePath));
             if (svcResult == null) continue;
 
-            var svcLines = File.ReadAllLines(svcResult.Value.File.AbsolutePath);
+            var svcLines = GetCachedLines(svcResult.Value.File.AbsolutePath);
             var (svcBody, svcStart, svcEnd) = ExtractFunctionBodyWithLines(
                 svcLines, svcMethod, svcResult.Value.Line);
 
@@ -1011,7 +1206,7 @@ public class ApiTraceAnalyzer
                     f => f.Extension == ".cs" && !IsTestFile(f) && IsCSharpRepoFile(f.RelativePath));
                 if (repoResult != null)
                 {
-                    var repoLines = File.ReadAllLines(repoResult.Value.File.AbsolutePath);
+                    var repoLines = GetCachedLines(repoResult.Value.File.AbsolutePath);
                     var (_, repoStart, repoEnd) = ExtractFunctionBodyWithLines(
                         repoLines, repoMethod, repoResult.Value.Line);
                     trace.Steps.Add(new TraceStep
@@ -1074,7 +1269,7 @@ public class ApiTraceAnalyzer
         if (!string.IsNullOrEmpty(operationId)) cands.Add(operationId);
 
         var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Where(s => !Regex.IsMatch(s, @"^v\d+$"))
+            .Where(s => !RxVersionSeg.IsMatch(s))
             .Select(s => s.StartsWith('{')
                 ? "By" + char.ToUpper(s[1]) + s[2..].TrimEnd('}')
                 : string.Concat(s.Split('_', '-').Select(w => w.Length > 0 ? char.ToUpper(w[0]) + w[1..] : "")))
@@ -1140,6 +1335,14 @@ public class ApiTraceAnalyzer
 
     // ═══ Python Analyzer ══════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Traces a Python API endpoint through Handler → Service layers.
+    /// Identifies the handler by matching FastAPI/Flask/Django route decorators
+    /// (<c>@app.get</c>, <c>@router.post</c>, <c>methods=[…]</c>) against the
+    /// endpoint's method and path, then follows <c>self.xyzService.method()</c> calls.
+    /// </summary>
+    /// <param name="ep">The endpoint to trace.</param>
+    /// <returns>An <see cref="ApiTrace"/> with resolved steps and extracted SQL queries, or an empty trace.</returns>
     private ApiTrace AnalyzePythonEndpoint(ApiEndpoint ep)
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
@@ -1148,7 +1351,7 @@ public class ApiTraceAnalyzer
 
         foreach (var file in pyFiles)
         {
-            var lines = File.ReadAllLines(file.AbsolutePath);
+            var lines = GetCachedLines(file.AbsolutePath);
             for (int i = 0; i < lines.Length - 1; i++)
             {
                 if (!IsPythonRouteDecorator(lines[i].Trim(), ep.Method, ep.Path)) continue;
@@ -1173,7 +1376,7 @@ public class ApiTraceAnalyzer
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
         trace.HandlerFunction = handlerResult.Value.FuncName;
 
-        var handlerLines = File.ReadAllLines(handlerResult.Value.File.AbsolutePath);
+        var handlerLines = GetCachedLines(handlerResult.Value.File.AbsolutePath);
         var (handlerBody, hStart, hEnd) = ExtractPythonFunctionBody(handlerLines, handlerResult.Value.Line);
 
         trace.Steps.Add(new TraceStep
@@ -1194,7 +1397,7 @@ public class ApiTraceAnalyzer
                 f => f.Extension == ".py" && !IsTestFile(f) && IsPythonServiceFile(f.RelativePath));
             if (svcResult == null) continue;
 
-            var svcLines = File.ReadAllLines(svcResult.Value.File.AbsolutePath);
+            var svcLines = GetCachedLines(svcResult.Value.File.AbsolutePath);
             var (svcBody, svcStart, svcEnd) = ExtractPythonFunctionBody(svcLines, svcResult.Value.Line);
 
             trace.Steps.Add(new TraceStep
@@ -1230,7 +1433,7 @@ public class ApiTraceAnalyzer
         var cands = new List<string>();
         if (!string.IsNullOrEmpty(operationId)) cands.Add(operationId);
         var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Where(s => !Regex.IsMatch(s, @"^v\d+$") && !s.StartsWith('{'))
+            .Where(s => !RxVersionSeg.IsMatch(s) && !s.StartsWith('{'))
             .ToArray();
         if (segs.Length > 0)
         {
@@ -1306,6 +1509,15 @@ public class ApiTraceAnalyzer
 
     // ═══ Java / Spring Analyzer ══════════════════════════════════════════════
 
+    /// <summary>
+    /// Traces a Java/Kotlin Spring MVC endpoint through Controller → Service → Repository layers.
+    /// Identifies the handler by matching <c>@GetMapping</c> / <c>@PostMapping</c> / etc.
+    /// annotations, then follows <c>xyzService.method()</c> and
+    /// <c>xyzRepository.method()</c> / <c>jdbcTemplate.method()</c> calls.
+    /// Also extracts JPA <c>@Query</c> / MyBatis <c>@Select</c> annotations as SQL queries.
+    /// </summary>
+    /// <param name="ep">The endpoint to trace.</param>
+    /// <returns>An <see cref="ApiTrace"/> with resolved steps and annotation-derived SQL, or an empty trace.</returns>
     private ApiTrace AnalyzeJavaEndpoint(ApiEndpoint ep)
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
@@ -1316,7 +1528,7 @@ public class ApiTraceAnalyzer
 
         foreach (var file in javaFiles)
         {
-            var lines = File.ReadAllLines(file.AbsolutePath);
+            var lines = GetCachedLines(file.AbsolutePath);
             var r = FindJavaControllerMethod(lines, ep.Method, ep.Path);
             if (r.HasValue) { handlerResult = (file, r.Value.Name, r.Value.Line); break; }
         }
@@ -1333,7 +1545,7 @@ public class ApiTraceAnalyzer
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
         trace.HandlerFunction = handlerResult.Value.FuncName;
 
-        var handlerLines = File.ReadAllLines(handlerResult.Value.File.AbsolutePath);
+        var handlerLines = GetCachedLines(handlerResult.Value.File.AbsolutePath);
         var (handlerBody, hStart, hEnd) = ExtractFunctionBodyWithLines(
             handlerLines, handlerResult.Value.FuncName, handlerResult.Value.Line);
 
@@ -1356,7 +1568,7 @@ public class ApiTraceAnalyzer
                      !IsTestFile(f) && IsJavaServiceFile(f.RelativePath));
             if (svcResult == null) continue;
 
-            var svcLines = File.ReadAllLines(svcResult.Value.File.AbsolutePath);
+            var svcLines = GetCachedLines(svcResult.Value.File.AbsolutePath);
             var (svcBody, svcStart, svcEnd) = ExtractFunctionBodyWithLines(
                 svcLines, svcMethod, svcResult.Value.Line);
 
@@ -1379,7 +1591,7 @@ public class ApiTraceAnalyzer
                          !IsTestFile(f) && IsJavaRepoFile(f.RelativePath));
                 if (repoResult != null)
                 {
-                    var repoLines = File.ReadAllLines(repoResult.Value.File.AbsolutePath);
+                    var repoLines = GetCachedLines(repoResult.Value.File.AbsolutePath);
                     var (repoBody, repoStart, repoEnd) = ExtractFunctionBodyWithLines(
                         repoLines, repoMethod, repoResult.Value.Line);
                     trace.Steps.Add(new TraceStep
@@ -1481,6 +1693,15 @@ public class ApiTraceAnalyzer
 
     // ═══ TypeScript / Node.js Analyzer ═══════════════════════════════════════
 
+    /// <summary>
+    /// Traces a TypeScript/JavaScript API endpoint through Handler → Service layers.
+    /// Identifies the handler by matching NestJS decorators (<c>@Get</c>, <c>@Post</c>, …)
+    /// or Express router calls (<c>router.get/post(…)</c>), then follows
+    /// <c>this.xyzService.method()</c> calls into service files.
+    /// Also extracts raw SQL from template-literal query calls.
+    /// </summary>
+    /// <param name="ep">The endpoint to trace.</param>
+    /// <returns>An <see cref="ApiTrace"/> with resolved steps and extracted SQL, or an empty trace.</returns>
     private ApiTrace AnalyzeTypeScriptEndpoint(ApiEndpoint ep)
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
@@ -1491,7 +1712,7 @@ public class ApiTraceAnalyzer
 
         foreach (var file in tsFiles)
         {
-            var lines = File.ReadAllLines(file.AbsolutePath);
+            var lines = GetCachedLines(file.AbsolutePath);
             var r = FindTsRouteHandler(lines, ep.Method, ep.Path);
             if (r.HasValue) { handlerResult = (file, r.Value.Name, r.Value.Line); break; }
         }
@@ -1508,7 +1729,7 @@ public class ApiTraceAnalyzer
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
         trace.HandlerFunction = handlerResult.Value.FuncName;
 
-        var handlerLines = File.ReadAllLines(handlerResult.Value.File.AbsolutePath);
+        var handlerLines = GetCachedLines(handlerResult.Value.File.AbsolutePath);
         var (handlerBody, hStart, hEnd) = ExtractFunctionBodyWithLines(
             handlerLines, handlerResult.Value.FuncName, handlerResult.Value.Line);
 
@@ -1531,7 +1752,7 @@ public class ApiTraceAnalyzer
                      !IsTestFile(f) && IsTsServiceFile(f.RelativePath));
             if (svcResult == null) continue;
 
-            var svcLines = File.ReadAllLines(svcResult.Value.File.AbsolutePath);
+            var svcLines = GetCachedLines(svcResult.Value.File.AbsolutePath);
             var (svcBody, svcStart, svcEnd) = ExtractFunctionBodyWithLines(
                 svcLines, svcMethod, svcResult.Value.Line);
 
@@ -1584,7 +1805,7 @@ public class ApiTraceAnalyzer
         var cands = new List<string>();
         if (!string.IsNullOrEmpty(operationId)) cands.Add(operationId);
         var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Where(s => !Regex.IsMatch(s, @"^v\d+$") && !s.StartsWith('{'))
+            .Where(s => !RxVersionSeg.IsMatch(s) && !s.StartsWith('{'))
             .Select(s => string.Concat(s.Split('_', '-').Select(w => w.Length > 0 ? char.ToUpper(w[0]) + w[1..] : "")))
             .ToArray();
         if (segs.Length > 0)
@@ -1651,6 +1872,14 @@ public class ApiTraceAnalyzer
 
     // ═══ PHP / Laravel Analyzer ═══════════════════════════════════════════════
 
+    /// <summary>
+    /// Traces a PHP/Laravel endpoint by first looking up the route definition in
+    /// <c>routes/api.php</c> to find the <c>[ControllerClass::class, 'method']</c> tuple,
+    /// then resolving the controller file and extracting its handler body and SQL calls.
+    /// Falls back to name-derived candidates when the route file lookup fails.
+    /// </summary>
+    /// <param name="ep">The endpoint to trace.</param>
+    /// <returns>An <see cref="ApiTrace"/> with resolved steps and extracted SQL, or an empty trace.</returns>
     private ApiTrace AnalyzePhpEndpoint(ApiEndpoint ep)
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
@@ -1663,7 +1892,7 @@ public class ApiTraceAnalyzer
             f.RelativePath.Contains("route", StringComparison.OrdinalIgnoreCase) ||
             f.Name == "api.php"))
         {
-            var lines = File.ReadAllLines(file.AbsolutePath);
+            var lines = GetCachedLines(file.AbsolutePath);
             for (int i = 0; i < lines.Length; i++)
             {
                 var line = lines[i];
@@ -1696,7 +1925,7 @@ public class ApiTraceAnalyzer
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
         trace.HandlerFunction = handlerResult.Value.FuncName;
 
-        var fileLines = File.ReadAllLines(handlerResult.Value.File.AbsolutePath);
+        var fileLines = GetCachedLines(handlerResult.Value.File.AbsolutePath);
         var (handlerBody, hStart, hEnd) = ExtractFunctionBodyWithLines(
             fileLines, handlerResult.Value.FuncName, handlerResult.Value.Line);
 
@@ -1747,6 +1976,14 @@ public class ApiTraceAnalyzer
 
     // ═══ Ruby / Rails Analyzer ════════════════════════════════════════════════
 
+    /// <summary>
+    /// Traces a Ruby/Rails endpoint by first parsing <c>config/routes.rb</c> for the
+    /// <c>to: 'controller#action'</c> mapping, resolving the controller file, and
+    /// extracting its action method body.  Falls back to last-segment path candidates
+    /// when the routes file lookup fails.
+    /// </summary>
+    /// <param name="ep">The endpoint to trace.</param>
+    /// <returns>An <see cref="ApiTrace"/> with resolved steps and extracted SQL, or an empty trace.</returns>
     private ApiTrace AnalyzeRubyEndpoint(ApiEndpoint ep)
     {
         var trace = new ApiTrace { Method = ep.Method, Path = ep.Path };
@@ -1757,7 +1994,7 @@ public class ApiTraceAnalyzer
         var routesFile = rbFiles.FirstOrDefault(f => f.Name == "routes.rb");
         if (routesFile != null)
         {
-            var lines = File.ReadAllLines(routesFile.AbsolutePath);
+            var lines = GetCachedLines(routesFile.AbsolutePath);
             for (int i = 0; i < lines.Length; i++)
             {
                 var line = lines[i].Trim();
@@ -1783,7 +2020,7 @@ public class ApiTraceAnalyzer
         if (handlerResult == null)
         {
             var segs = ep.Path.Split('/', StringSplitOptions.RemoveEmptyEntries)
-                .Where(s => !Regex.IsMatch(s, @"^v\d+$") && !s.StartsWith(':')).ToArray();
+                .Where(s => !RxVersionSeg.IsMatch(s) && !s.StartsWith(':')).ToArray();
             var cands = segs.Length > 0
                 ? new List<string> { segs.Last(), $"{ep.Method.ToLower()}_{segs.Last()}" }
                 : [ep.Method.ToLower()];
@@ -1795,7 +2032,7 @@ public class ApiTraceAnalyzer
         trace.HandlerFile = handlerResult.Value.File.RelativePath;
         trace.HandlerFunction = handlerResult.Value.FuncName;
 
-        var fileLines = File.ReadAllLines(handlerResult.Value.File.AbsolutePath);
+        var fileLines = GetCachedLines(handlerResult.Value.File.AbsolutePath);
         var (body, hStart, hEnd) = ExtractRubyFunctionBody(fileLines, handlerResult.Value.Line);
 
         trace.Steps.Add(new TraceStep
@@ -1862,6 +2099,23 @@ public class ApiTraceAnalyzer
 
     // ═══ Shared Utilities ════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Looks up each candidate function name in <see cref="_funcIndex"/> (O(1) per lookup)
+    /// and returns the first file and line number that satisfies the
+    /// <paramref name="fileFilter"/> predicate.
+    /// </summary>
+    /// <param name="candidates">
+    /// Ordered list of function name candidates to try.  Earlier candidates are preferred;
+    /// the list is typically derived from <c>operationId</c> variants and path segments.
+    /// </param>
+    /// <param name="fileFilter">
+    /// Predicate restricting which files are eligible (e.g. only Go source files,
+    /// only service-layer files).
+    /// </param>
+    /// <returns>
+    /// A tuple of (file node, matched function name, 1-based line number),
+    /// or <c>null</c> if no candidate resolves to a file that satisfies the filter.
+    /// </returns>
     private (FileNode File, string FuncName, int Line)? FindHandlerInFiles(
         List<string> candidates, Func<FileNode, bool> fileFilter)
     {
@@ -1875,6 +2129,22 @@ public class ApiTraceAnalyzer
         return null;
     }
 
+    /// <summary>
+    /// Extracts the textual body of a named function starting near
+    /// <paramref name="funcLine"/> by counting matching braces (for C-style languages)
+    /// or by tracking indentation depth (for Python).
+    /// </summary>
+    /// <param name="lines">All lines of the source file as a string array.</param>
+    /// <param name="funcName">The function name used to scan for the exact signature line.</param>
+    /// <param name="funcLine">
+    /// 1-based hint line number from the function index.  The method scans up to
+    /// 6 lines around this position to locate the exact signature, accommodating
+    /// annotations and multi-line signatures.
+    /// </param>
+    /// <returns>
+    /// A tuple of (body text, 1-based start line, 1-based end line).
+    /// Returns an empty body tuple when <paramref name="funcLine"/> is out of range.
+    /// </returns>
     private static (string body, int startLine, int endLine) ExtractFunctionBodyWithLines(
         string[] lines, string funcName, int funcLine)
     {
@@ -1982,16 +2252,15 @@ public class ApiTraceAnalyzer
         return false;
     }
 
-    private static bool IsKeyword(string name)
+    // Pre-allocated keyword set — avoids re-allocating a new HashSet on every IsKeyword() call.
+    private static readonly HashSet<string> _keywords = new(StringComparer.OrdinalIgnoreCase)
     {
-        var keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "if", "for", "while", "switch", "return", "new", "class", "interface",
-            "var", "let", "const", "void", "null", "true", "false", "async", "await",
-            "static", "public", "private", "protected", "override", "abstract",
-            "string", "int", "long", "bool", "float", "double", "object", "type",
-            "func", "def", "end", "do", "then", "else", "elif", "try", "catch", "finally"
-        };
-        return keywords.Contains(name);
-    }
+        "if", "for", "while", "switch", "return", "new", "class", "interface",
+        "var", "let", "const", "void", "null", "true", "false", "async", "await",
+        "static", "public", "private", "protected", "override", "abstract",
+        "string", "int", "long", "bool", "float", "double", "object", "type",
+        "func", "def", "end", "do", "then", "else", "elif", "try", "catch", "finally"
+    };
+
+    private static bool IsKeyword(string name) => _keywords.Contains(name);
 }

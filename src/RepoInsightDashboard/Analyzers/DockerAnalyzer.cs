@@ -1,3 +1,23 @@
+// ============================================================
+// DockerAnalyzer.cs — Dockerfile and Docker Compose parser
+// ============================================================
+// Architecture: stateless service class; instantiated once per analyze run.
+// Supported inputs:
+//   1. Dockerfile       — parses FROM, EXPOSE, ENV, ENTRYPOINT, CMD, WORKDIR
+//   2. docker-compose.yml / .yaml — parses services, ports, environment,
+//      depends_on, restart policy, and build context
+//
+// Security (OWASP A3:2021 — Sensitive Data Exposure):
+//   ENV values whose keys contain sensitive keywords (_sensitiveEnvKeywords)
+//   are masked to "***masked***" before being stored, preventing secrets
+//   from leaking into the generated dashboard HTML output.
+//
+// Usage:
+//   var analyzer = new DockerAnalyzer();
+//   var containers = analyzer.Analyze(allFiles);           // docker-compose
+//   var dockerfile = analyzer.AnalyzeDockerfile(allFiles); // Dockerfile
+// ============================================================
+
 using System.Text.RegularExpressions;
 using RepoInsightDashboard.Models;
 using YamlDotNet.Serialization;
@@ -5,8 +25,47 @@ using YamlDotNet.Serialization.NamingConventions;
 
 namespace RepoInsightDashboard.Analyzers;
 
+/// <summary>
+/// Parses Dockerfile and docker-compose files in a repository, extracting
+/// container services, port mappings, environment variables, and build contexts.
+/// </summary>
+/// <remarks>
+/// <para>
+/// When a docker-compose file is present, <see cref="Analyze"/> returns one
+/// <see cref="ContainerInfo"/> per declared service.  When only a Dockerfile
+/// is present, <see cref="SynthesizeContainersFromDockerfile"/> creates a
+/// virtual service from the EXPOSE instructions.
+/// </para>
+/// <para>
+/// ENV values whose keys match any entry in <see cref="_sensitiveEnvKeywords"/>
+/// are masked to <c>***masked***</c> before storage — consistent with
+/// <c>EnvFileAnalyzer</c>'s behaviour (OWASP A3:2021 Sensitive Data Exposure).
+/// </para>
+/// </remarks>
 public class DockerAnalyzer
 {
+    // Keywords matching EnvFileAnalyzer.SensitiveKeywords — Dockerfile ENV values
+    // whose keys contain these terms are masked to "***masked***" in output.
+    private static readonly string[] _sensitiveEnvKeywords =
+    [
+        "password", "passwd", "secret", "key", "token", "credential",
+        "api_key", "apikey", "private", "auth", "cert", "pass"
+    ];
+
+    /// <summary>
+    /// Parses a Dockerfile line-by-line and extracts its base image, multi-stage build
+    /// names, exposed ports, environment variables, entry point, CMD, and working directory.
+    /// </summary>
+    /// <param name="file">The <see cref="FileNode"/> representing the Dockerfile to parse.</param>
+    /// <returns>
+    /// A <see cref="DockerfileInfo"/> populated with the parsed values, or <c>null</c>
+    /// if the file does not exist on disk at the time of analysis.
+    /// </returns>
+    /// <remarks>
+    /// Only the first FROM instruction sets <see cref="DockerfileInfo.BaseImage"/>; subsequent
+    /// FROM instructions add stage names for multi-stage builds.  Lines beginning with
+    /// <c>#</c> (comments) and blank lines are skipped to avoid false positives.
+    /// </remarks>
     public DockerfileInfo? ParseDockerfile(FileNode file)
     {
         if (!File.Exists(file.AbsolutePath)) return null;
@@ -49,10 +108,17 @@ public class DockerAnalyzer
                     if (parts.Length > 1)
                     {
                         var envParts = parts[1].Split('=', 2);
+                        var envKey = envParts[0].Trim();
+                        var rawVal = envParts.Length > 1 ? envParts[1].Trim() : "";
+                        // Mask values for keys that look like credentials/secrets,
+                        // consistent with EnvFileAnalyzer's masking behaviour.
+                        var isSensitive = _sensitiveEnvKeywords.Any(kw =>
+                            envKey.Contains(kw, StringComparison.OrdinalIgnoreCase));
                         info.EnvVars.Add(new EnvVariable
                         {
-                            Key = envParts[0].Trim(),
-                            Value = envParts.Length > 1 ? envParts[1].Trim() : "",
+                            Key = envKey,
+                            Value = isSensitive ? "***masked***" : rawVal,
+                            IsSensitive = isSensitive,
                             SourceFile = file.RelativePath
                         });
                     }
@@ -71,6 +137,21 @@ public class DockerAnalyzer
         return info;
     }
 
+    /// <summary>
+    /// Parses a docker-compose YAML file and returns one <see cref="ContainerInfo"/>
+    /// per service defined under the top-level <c>services</c> key.
+    /// </summary>
+    /// <param name="file">The <see cref="FileNode"/> representing the compose file.</param>
+    /// <returns>
+    /// List of <see cref="ContainerInfo"/> objects, one per service.
+    /// Returns an empty list if the file is missing, empty, or structurally malformed.
+    /// </returns>
+    /// <remarks>
+    /// Uses YamlDotNet with <c>IgnoreUnmatchedProperties</c> so that docker-compose v2/v3
+    /// extension fields (e.g. <c>healthcheck</c>, <c>deploy</c>, <c>x-custom</c>) do not
+    /// throw during deserialisation.  All exceptions are silently swallowed so that one
+    /// malformed compose file does not abort the entire analysis run.
+    /// </remarks>
     public List<ContainerInfo> ParseDockerCompose(FileNode file)
     {
         var containers = new List<ContainerInfo>();
@@ -118,6 +199,10 @@ public class DockerAnalyzer
                     foreach (var portEntry in portsList)
                     {
                         var portStr = portEntry?.ToString() ?? "";
+                        // Port format: [hostPort:]containerPort[/protocol]
+                        // Group 1 = optional host port, Group 2 = container port, Group 3 = optional protocol.
+                        // Examples: "8080:80" → host=8080, container=80; "443/udp" → host=443, container=443, proto=udp.
+                        // When no host port is specified (e.g. "80"), host port defaults to the container port.
                         var match = Regex.Match(portStr, @"^(?:(\d+):)?(\d+)(?:/(\w+))?$");
                         if (match.Success)
                             container.Ports.Add(new PortMapping
@@ -175,6 +260,15 @@ public class DockerAnalyzer
         return containers;
     }
 
+    /// <summary>
+    /// Scans <paramref name="files"/> for docker-compose YAML files and returns a
+    /// consolidated list of <see cref="ContainerInfo"/> objects from all discovered files.
+    /// </summary>
+    /// <param name="files">Flat file list produced by <see cref="FileScanner"/>.</param>
+    /// <returns>
+    /// Combined list of <see cref="ContainerInfo"/> objects from all compose files found.
+    /// Returns an empty list if no compose files are present.
+    /// </returns>
     public List<ContainerInfo> Analyze(List<FileNode> files)
     {
         var containers = new List<ContainerInfo>();
@@ -187,6 +281,14 @@ public class DockerAnalyzer
         return containers;
     }
 
+    /// <summary>
+    /// Finds the first file named <c>Dockerfile</c> (case-insensitive) in
+    /// <paramref name="files"/> and returns its parsed representation.
+    /// </summary>
+    /// <param name="files">Flat file list produced by <see cref="FileScanner"/>.</param>
+    /// <returns>
+    /// A populated <see cref="DockerfileInfo"/>, or <c>null</c> if no Dockerfile is found.
+    /// </returns>
     public DockerfileInfo? AnalyzeDockerfile(List<FileNode> files)
     {
         var dockerfile = files.FirstOrDefault(f =>

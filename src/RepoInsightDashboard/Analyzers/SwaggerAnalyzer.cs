@@ -13,6 +13,7 @@
 // ============================================================
 
 using System.Text.RegularExpressions;
+using Microsoft.OpenApi.Any;
 using Microsoft.OpenApi.Models;
 using Microsoft.OpenApi.Readers;
 using Newtonsoft.Json.Linq;
@@ -110,7 +111,8 @@ public class SwaggerAnalyzer
                                 Description  = response.Description ?? "",
                                 ContentType  = firstContent?.Key,
                                 Schema       = schema?.Type,
-                                SchemaJson   = SerializeSchema(schema)?.ToString(Newtonsoft.Json.Formatting.Indented)
+                                SchemaJson   = SerializeSchema(schema, 0, doc)?.ToString(Newtonsoft.Json.Formatting.Indented),
+                                ExampleJson  = GenerateExampleJson(schema, doc)
                             });
                         }
 
@@ -130,7 +132,8 @@ public class SwaggerAnalyzer
                     }
                 }
             }
-            catch { /* skip malformed files */ }
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+            { /* skip malformed / unsupported OpenAPI files */ }
         }
 
         // 2. GraphQL schema files — synthesise pseudo-endpoints for each Query/Mutation/Subscription field.
@@ -139,7 +142,7 @@ public class SwaggerAnalyzer
         foreach (var file in files.Where(f => !f.IsDirectory && IsGraphQlFile(f) && f.SizeBytes < MaxFileSizeBytes))
         {
             try { endpoints.AddRange(ParseGraphQlSchema(file)); }
-            catch { }
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) { }
         }
 
         // 3. gRPC proto files — synthesise pseudo-endpoints for each rpc method.
@@ -147,7 +150,7 @@ public class SwaggerAnalyzer
         foreach (var file in files.Where(f => !f.IsDirectory && f.Extension == ".proto" && f.SizeBytes < MaxFileSizeBytes))
         {
             try { endpoints.AddRange(ParseProtoFile(file)); }
-            catch { }
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException) { }
         }
 
         return endpoints;
@@ -291,12 +294,36 @@ public class SwaggerAnalyzer
     /// <summary>
     /// Recursively serialises an OpenAPI schema to a JObject for display.
     /// Depth-limited to 6 levels to avoid infinite recursion on circular refs.
+    /// When a schema has a $ref, attempts to resolve it from doc.Components.Schemas.
     /// </summary>
-    private static JObject? SerializeSchema(OpenApiSchema? schema, int depth = 0)
+    private static JObject? SerializeSchema(OpenApiSchema? schema, int depth = 0,
+        OpenApiDocument? doc = null, HashSet<string>? visited = null)
     {
         if (schema == null || depth > 6) return null;
 
-        if (schema.Reference != null)
+        // Resolve $ref only when no inline content is available (same logic as BuildExampleToken)
+        bool hasInlineContent = (schema.Properties?.Count > 0)
+            || schema.Items != null
+            || schema.Enum?.Count > 0
+            || !string.IsNullOrEmpty(schema.Type)
+            || schema.AllOf?.Count > 0
+            || schema.AnyOf?.Count > 0;
+
+        if (schema.Reference != null && !hasInlineContent && doc != null)
+        {
+            var refId = schema.Reference.Id;
+            visited ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!visited.Add(refId)) return new JObject { ["$ref"] = refId }; // circular guard
+            if (doc.Components?.Schemas?.TryGetValue(refId, out var resolved) == true && resolved != null)
+            {
+                var result = SerializeSchema(resolved, depth + 1, doc, visited);
+                visited.Remove(refId);
+                return result;
+            }
+            visited.Remove(refId);
+        }
+
+        if (schema.Reference != null && !hasInlineContent)
             return new JObject { ["$ref"] = schema.Reference.Id };
 
         var obj = new JObject();
@@ -315,7 +342,7 @@ public class SwaggerAnalyzer
         }
 
         if (schema.Enum?.Count > 0)
-            obj["enum"] = new JArray(schema.Enum.Select(e => e.ToString()));
+            obj["enum"] = new JArray(schema.Enum.Select(e => AnyToJToken(e)));
 
         if (schema.Required?.Count > 0)
             obj["required"] = new JArray(schema.Required);
@@ -325,7 +352,7 @@ public class SwaggerAnalyzer
             var props = new JObject();
             foreach (var (propName, propSchema) in schema.Properties)
             {
-                var serialized = SerializeSchema(propSchema, depth + 1);
+                var serialized = SerializeSchema(propSchema, depth + 1, doc, visited);
                 if (serialized != null) props[propName] = serialized;
             }
             obj["properties"] = props;
@@ -333,19 +360,158 @@ public class SwaggerAnalyzer
 
         if (schema.Items != null)
         {
-            var items = SerializeSchema(schema.Items, depth + 1);
+            var items = SerializeSchema(schema.Items, depth + 1, doc, visited);
             if (items != null) obj["items"] = items;
         }
 
         if (schema.AllOf?.Count > 0)
             obj["allOf"] = new JArray(schema.AllOf
-                .Select(s => (JToken?)SerializeSchema(s, depth + 1))
+                .Select(s => (JToken?)SerializeSchema(s, depth + 1, doc, visited))
                 .Where(s => s != null));
         if (schema.AnyOf?.Count > 0)
             obj["anyOf"] = new JArray(schema.AnyOf
-                .Select(s => (JToken?)SerializeSchema(s, depth + 1))
+                .Select(s => (JToken?)SerializeSchema(s, depth + 1, doc, visited))
                 .Where(s => s != null));
 
         return obj.Count > 0 ? obj : null;
     }
+
+    // ── Example JSON Generator ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Converts an <see cref="IOpenApiAny"/> value to a Newtonsoft <see cref="JToken"/>.
+    /// Handles the concrete OpenApi primitive types directly so that calling
+    /// <c>.ToString()</c> (which returns the C# type name) is avoided.
+    /// </summary>
+    private static JToken AnyToJToken(IOpenApiAny? any) => any switch
+    {
+        OpenApiString  s => s.Value,
+        OpenApiInteger i => (JToken)i.Value,
+        OpenApiLong    l => (JToken)l.Value,
+        OpenApiFloat   f => (JToken)f.Value,
+        OpenApiDouble  d => (JToken)d.Value,
+        OpenApiBoolean b => (JToken)b.Value,
+        OpenApiByte    by => (JToken)by.Value,
+        OpenApiDate    dt => dt.Value.ToString("yyyy-MM-dd"),
+        OpenApiDateTime dtt => dtt.Value.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+        // Recursively handle array/object enum values (avoids CLR type-name strings)
+        OpenApiArray   arr => new JArray(arr.Select(item => AnyToJToken(item))),
+        OpenApiObject  obj => new JObject(obj.Select(kv => new JProperty(kv.Key, AnyToJToken(kv.Value)))),
+        null => JValue.CreateNull(),
+        _    => JValue.CreateNull()  // unknown future types — null is safer than a CLR type name string
+    };
+
+    /// <summary>
+    /// Generates a realistic example JSON instance from an OpenAPI schema.
+    /// Resolves $ref pointers using the document's component schemas.
+    /// Arrays produce two example items; objects recurse into properties.
+    /// Enum fields use the first enum value; primitive types use type-appropriate values.
+    /// Depth is capped at 6 to prevent infinite recursion on self-referential schemas.
+    /// </summary>
+    private static string? GenerateExampleJson(OpenApiSchema? schema, OpenApiDocument? doc)
+    {
+        if (schema == null || doc == null) return null;
+        try
+        {
+            var token = BuildExampleToken(schema, doc, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            return token?.ToString(Newtonsoft.Json.Formatting.Indented);
+        }
+        catch { return null; }
+    }
+
+    private static JToken? BuildExampleToken(OpenApiSchema? schema, OpenApiDocument doc,
+        int depth, HashSet<string> visited)
+    {
+        if (schema == null || depth > 6) return null;
+
+        // Resolve pure $ref pointers — only when the schema has no inline resolved content.
+        // Schemas retrieved from doc.Components.Schemas have both Reference AND Properties
+        // set simultaneously (the Reference is metadata, Properties is the resolved content).
+        // We only follow a reference when there is nothing else to use, to avoid an infinite
+        // loop caused by the self-referential References on component schema objects.
+        bool hasInlineContent = (schema.Properties?.Count > 0)
+            || schema.Items != null
+            || schema.Enum?.Count > 0
+            || !string.IsNullOrEmpty(schema.Type)
+            || schema.AllOf?.Count > 0
+            || schema.AnyOf?.Count > 0
+            || schema.OneOf?.Count > 0;
+
+        if (schema.Reference != null && !hasInlineContent)
+        {
+            var refId = schema.Reference.Id;
+            if (!visited.Add(refId))
+                return new JObject(); // circular reference guard: return empty object
+            if (doc.Components?.Schemas?.TryGetValue(refId, out var resolved) == true && resolved != null)
+            {
+                var result = BuildExampleToken(resolved, doc, depth + 1, visited);
+                visited.Remove(refId);
+                return result;
+            }
+            visited.Remove(refId);
+            return new JObject { ["$ref"] = refId };
+        }
+
+        // Enum — use the first enum value
+        if (schema.Enum?.Count > 0)
+            return AnyToJToken(schema.Enum.First());
+
+        var schemaType = schema.Type?.ToLowerInvariant();
+
+        // Array — produce two example items
+        if (schemaType == "array" || schema.Items != null)
+        {
+            var itemSchema = schema.Items;
+            var item1 = BuildExampleToken(itemSchema, doc, depth + 1, new HashSet<string>(visited, StringComparer.OrdinalIgnoreCase));
+            var item2 = BuildExampleToken(itemSchema, doc, depth + 1, new HashSet<string>(visited, StringComparer.OrdinalIgnoreCase));
+            return new JArray(item1 ?? new JObject(), item2 ?? new JObject());
+        }
+
+        // Object — recurse into all properties
+        if (schemaType == "object" || schema.Properties?.Count > 0)
+        {
+            var obj = new JObject();
+            if (schema.Properties != null)
+            {
+                foreach (var (propName, propSchema) in schema.Properties)
+                    obj[propName] = BuildExampleToken(propSchema, doc, depth + 1, new HashSet<string>(visited, StringComparer.OrdinalIgnoreCase))
+                        ?? JValue.CreateNull();
+            }
+            return obj;
+        }
+
+        // Handle allOf / anyOf / oneOf — use the first schema in the list
+        if (schema.AllOf?.Count > 0)
+            return BuildExampleToken(schema.AllOf.First(), doc, depth + 1, visited);
+        if (schema.AnyOf?.Count > 0)
+            return BuildExampleToken(schema.AnyOf.First(), doc, depth + 1, visited);
+        if (schema.OneOf?.Count > 0)
+            return BuildExampleToken(schema.OneOf.First(), doc, depth + 1, visited);
+
+        // Use the schema's built-in example if present
+        if (schema.Example != null)
+        {
+            try { return JToken.Parse(schema.Example.ToString() ?? "null"); }
+            catch { return schema.Example.ToString(); }
+        }
+
+        // Primitive type defaults
+        return (schemaType, schema.Format?.ToLowerInvariant()) switch
+        {
+            ("string", "date-time") => "2024-01-01T00:00:00Z",
+            ("string", "date")      => "2024-01-01",
+            ("string", "uuid")      => "00000000-0000-0000-0000-000000000000",
+            ("string", "email")     => "user@example.com",
+            ("string", "uri")       => "https://example.com",
+            ("string", "password")  => "********",
+            ("string", _)           => "string",
+            ("integer", "int64")    => (long)0,
+            ("integer", _)          => (int)0,
+            ("number", "float")     => (float)0.0,
+            ("number", _)           => (double)0.0,
+            ("boolean", _)          => false,
+            _                       => (JToken)"string"
+        };
+    }
+
 }

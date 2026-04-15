@@ -1,3 +1,27 @@
+// ============================================================
+// HtmlDashboardGenerator.cs — Single-file HTML dashboard renderer
+// ============================================================
+// Architecture: stateless generator; takes a fully-populated DashboardData and
+//   produces a single self-contained HTML file with all CSS, JavaScript, and
+//   data inlined — no external CDN, font, or script URLs required.
+//
+// Security:
+//   • All user-derived strings are passed through HtmlEncode (HtmlEncoder.Default)
+//     before being written into HTML markup (CWE-79 / OWASP A03:2021 Injection).
+//   • JSON embedded in <script> uses StringEscapeHandling.EscapeHtml so that
+//     "</script>" sequences inside field values cannot break out of the script block.
+//   • Content-Security-Policy meta tag blocks all external resource loading.
+//     'unsafe-inline' is unavoidable because scripts and styles are fully inlined
+//     (adding nonces/hashes to a static generated file is not feasible).
+//   • Sensitive env-variable values are projected to "***masked***" in the sanitised
+//     safeData object before serialisation — raw secrets never reach the HTML output.
+//
+// Usage:
+//   var generator = new HtmlDashboardGenerator();
+//   string html = generator.Generate(dashboardData);
+//   File.WriteAllText("dashboard.html", html, Encoding.UTF8);
+// ============================================================
+
 using System.Text;
 using System.Text.Encodings.Web;
 using Newtonsoft.Json;
@@ -7,14 +31,50 @@ using RepoInsightDashboard.Models;
 
 namespace RepoInsightDashboard.Generators;
 
+/// <summary>
+/// Renders a fully self-contained HTML dashboard from a <see cref="DashboardData"/>
+/// snapshot, inlining all CSS, JavaScript, and JSON data into a single portable file.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The generated file has zero external dependencies — all styles, the RidGraph
+/// SVG graph engine, and the <c>window.__RID_DATA__</c> JSON payload are embedded
+/// inline, making the output suitable for offline viewing and secure file sharing.
+/// </para>
+/// <para>
+/// Security: every untrusted string written to HTML markup is passed through
+/// <see cref="HtmlEncode"/>, and all values embedded inside JSON script blocks use
+/// <see cref="Newtonsoft.Json.StringEscapeHandling.EscapeHtml"/> (CWE-79).
+/// </para>
+/// </remarks>
 public class HtmlDashboardGenerator
 {
     // camelCase for onclick data — JS expects ep.method, ep.path, c.name, etc.
     private static readonly JsonSerializerSettings _onclickJson = new()
     {
-        ContractResolver = new CamelCasePropertyNamesContractResolver(),
-        NullValueHandling = NullValueHandling.Ignore
+        ContractResolver     = new CamelCasePropertyNamesContractResolver(),
+        NullValueHandling    = NullValueHandling.Ignore,
+        // EscapeHtml is required: endpoint paths/summaries from untrusted repo content can
+        // contain '<', '>', '&' which must be unicode-escaped inside HTML onclick attributes.
+        StringEscapeHandling = StringEscapeHandling.EscapeHtml
     };
+    /// <summary>
+    /// Renders <paramref name="data"/> into a complete, self-contained HTML string
+    /// that can be written directly to a <c>.html</c> file.
+    /// </summary>
+    /// <param name="data">
+    /// Fully-populated <see cref="DashboardData"/> produced by
+    /// <see cref="Services.AnalysisOrchestrator"/>.
+    /// </param>
+    /// <returns>
+    /// UTF-8–compatible HTML string containing all sections, CSS, JavaScript, and data.
+    /// No further post-processing is needed before writing to disk.
+    /// </returns>
+    /// <remarks>
+    /// The method builds a sanitised projection of <paramref name="data"/> (<c>safeData</c>)
+    /// that replaces sensitive env-variable values with <c>***masked***</c> before JSON
+    /// serialisation, so no raw secrets are ever embedded in the output file (CWE-312).
+    /// </remarks>
     public string Generate(DashboardData data)
     {
         var sb = new StringBuilder();
@@ -57,7 +117,8 @@ public class HtmlDashboardGenerator
             data.SecurityRisks,
             data.DesignPatterns,
             data.CopilotSummary,
-            data.StartupSequence
+            data.StartupSequence,
+            data.Makefile
         };
         var jsonData = JsonConvert.SerializeObject(safeData, Formatting.None, jsonSettings);
 
@@ -66,6 +127,9 @@ public class HtmlDashboardGenerator
         sb.AppendLine("<head>");
         sb.AppendLine($"<meta charset=\"UTF-8\">");
         sb.AppendLine($"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
+        // Content-Security-Policy: block all external resource loading from the generated file.
+        // 'unsafe-inline' is required because all scripts and styles are inlined (no nonces).
+        sb.AppendLine("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:;\">");
         sb.AppendLine($"<title>{HtmlEncode(data.Project.Name)} — Repo Insight Dashboard</title>");
         sb.AppendLine(GetInlineStyles(data.Meta.Theme));
         sb.AppendLine("</head>");
@@ -86,6 +150,7 @@ public class HtmlDashboardGenerator
         sb.AppendLine(BuildSecuritySection(data));
         sb.AppendLine(BuildUnitTestSection(data));
         sb.AppendLine(BuildIntegrationTestSection(data));
+        sb.AppendLine(BuildMakefileSection(data));
         if (!string.IsNullOrEmpty(data.Project.CopilotInstructions))
             sb.AppendLine(BuildCopilotInstructionsSection(data));
         sb.AppendLine("</main>");
@@ -161,10 +226,29 @@ public class HtmlDashboardGenerator
             <a href="#section-inttests" class="nav-item" data-section="inttests">
               <span class="nav-icon">⚗️</span> 整合測試
             </a>
+            <a href="#section-makefile" class="nav-item" data-section="makefile">
+              <span class="nav-icon">⚙️</span> Makefile 指令區
+            </a>
           </nav>
         </aside>
         """;
 
+    /// <summary>
+    /// Builds a collapsible dashboard section with an accessible heading and a
+    /// keyboard-navigable collapse/expand button.
+    /// </summary>
+    /// <param name="id">
+    /// Section identifier used for the HTML <c>id</c> attributes and the JS
+    /// <c>toggleSection(id)</c> call.  Must be unique across all sections.
+    /// </param>
+    /// <param name="title">Display title shown in the section header bar.</param>
+    /// <param name="icon">Emoji or symbol rendered beside the title.</param>
+    /// <param name="content">Inner HTML string for the section body.</param>
+    /// <param name="collapsed">
+    /// When <c>true</c>, the section renders pre-collapsed.  Less critical sections
+    /// (file tree, tests, Makefile) start collapsed to reduce initial page scroll height.
+    /// </param>
+    /// <returns>HTML fragment for the full collapsible section element.</returns>
     private string BuildSection(string id, string title, string icon, string content, bool collapsed = false) => $"""
         <section class="section {(collapsed ? "collapsed" : "")}" id="section-{id}" aria-labelledby="heading-{id}">
           <div class="section-header" onclick="toggleSection('{id}')" role="button" tabindex="0"
@@ -265,6 +349,16 @@ public class HtmlDashboardGenerator
         return BuildSection("languages", "語言分佈", "🔤", content);
     }
 
+    /// <summary>
+    /// Renders a SVG donut chart for the language distribution using stroke-dasharray
+    /// on overlapping circles.  Each circle covers a fraction of the circumference,
+    /// producing pie-like segments without complex SVG arc path calculations.
+    /// </summary>
+    /// <param name="languages">Language list ordered by percentage descending.</param>
+    /// <returns>
+    /// SVG <c>&lt;circle&gt;</c> element fragments intended for injection inside an
+    /// <c>&lt;svg viewBox="0 0 120 120"&gt;</c> element.
+    /// </returns>
     private string BuildDonutChart(List<LanguageInfo> languages)
     {
         var segments = new StringBuilder();
@@ -493,7 +587,8 @@ public class HtmlDashboardGenerator
         if (data.StartupSequence.Count == 0)
             return BuildSection("startup", "啟動流程", "🚀", "<p class=\"text-secondary\">未偵測到容器服務啟動順序。</p>", true);
 
-        var seqSteps = string.Join("\n", data.StartupSequence.Take(10).Select((svc, i) =>
+        var visibleSequence = data.StartupSequence.Take(10).ToList();
+        var seqSteps = string.Join("\n", visibleSequence.Select((svc, i) =>
         {
             var container = data.Containers.FirstOrDefault(c => c.Name == svc);
             var ports = container?.Ports.Count > 0
@@ -502,7 +597,8 @@ public class HtmlDashboardGenerator
             var deps = container?.DependsOn.Count > 0
                 ? $"<span class='startup-deps'>依賴：{HtmlEncode(string.Join(", ", container.DependsOn))}</span>"
                 : "";
-            var arrow = i < data.StartupSequence.Count - 1 ? "<div class='startup-connector'>↓</div>" : "";
+            // Compare against visibleSequence.Count (not full list) so the last visible item has no arrow
+            var arrow = i < visibleSequence.Count - 1 ? "<div class='startup-connector'>↓</div>" : "";
             return $"""
                 <div class="startup-step">
                   <div class="startup-num">{i + 1}</div>
@@ -516,10 +612,10 @@ public class HtmlDashboardGenerator
                 """;
         }));
 
-        var ganttRows = string.Join("\n", data.StartupSequence.Take(10).Select((svc, i) =>
+        var ganttRows = string.Join("\n", visibleSequence.Select((svc, i) =>
         {
             var duration = 3 + (svc.Length % 5);
-            var start = data.StartupSequence.Take(i).Sum(s => 3 + (s.Length % 5) / 2);
+            var start = visibleSequence.Take(i).Sum(s => 3 + (s.Length % 5) / 2);
             var pctLeft = Math.Min(start * 5, 80);
             var pctWidth = Math.Max(duration * 5, 10);
             var colors = new[] { "#58a6ff", "#3fb950", "#d29922", "#bc8cff", "#f85149" };
@@ -816,6 +912,41 @@ public class HtmlDashboardGenerator
         return BuildSection("inttests", $"整合 / 驗收測試 ({total})", "⚗️", content, true);
     }
 
+    private string BuildMakefileSection(DashboardData data)
+    {
+        var mf = data.Makefile;
+        if (mf == null || string.IsNullOrWhiteSpace(mf.Content))
+        {
+            return BuildSection("makefile", "Makefile 指令區", "⚙️",
+                "<p style=\"color:#8b949e\">未偵測到 Makefile，亦無法自動生成。</p>", true);
+        }
+
+        var badge = mf.Exists
+            ? $"<span class=\"lang-badge\" style=\"background:#3fb95022;color:#3fb950;border:1px solid #3fb95044\">✓ 已找到</span>"
+            : $"<span class=\"lang-badge\" style=\"background:#d2992222;color:#d29922;border:1px solid #d2992244\">⚡ 自動生成</span>";
+
+        var targetsHtml = "";
+        if (mf.Targets.Count > 0)
+        {
+            targetsHtml = "<div style=\"margin-bottom:12px;display:flex;flex-wrap:wrap;gap:6px\">"
+                + string.Join("", mf.Targets.Select(t =>
+                    $"<code style=\"background:var(--surface);border:1px solid var(--border);padding:2px 8px;border-radius:4px;font-size:11px\">{HtmlEncode(t)}</code>"))
+                + "</div>";
+        }
+
+        var content = $"""
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+              {badge}
+              <span style="color:#8b949e;font-size:12px">{HtmlEncode(mf.FilePath)}</span>
+              <span style="color:#8b949e;font-size:12px">·</span>
+              <span style="color:#8b949e;font-size:12px">{mf.Targets.Count} 個指令</span>
+            </div>
+            {targetsHtml}
+            <pre class="dt-sql-code" style="max-height:600px;overflow-y:auto;tab-size:4">{HtmlEncode(mf.Content)}</pre>
+            """;
+        return BuildSection("makefile", "Makefile 指令區", "⚙️", content, true);
+    }
+
     private string BuildCopilotInstructionsSection(DashboardData data)
     {
         var content = $"""
@@ -838,15 +969,37 @@ public class HtmlDashboardGenerator
         </div>
         """;
 
+    /// <summary>
+    /// HTML-encodes <paramref name="text"/> using <see cref="HtmlEncoder.Default"/>
+    /// (the .NET platform-default encoder that encodes <c>&lt;</c>, <c>&gt;</c>, <c>&amp;</c>,
+    /// <c>&quot;</c>, and <c>&#x27;</c>).
+    /// Returns an empty string for <c>null</c> input to avoid null-check boilerplate at every call site.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="HtmlEncoder.Default"/> is used rather than <c>WebUtility.HtmlEncode</c>
+    /// because it is safe for both HTML element content and attribute values (CWE-79 / OWASP A03:2021).
+    /// </remarks>
     private static string HtmlEncode(string? text)
         => text == null ? "" : HtmlEncoder.Default.Encode(text);
 
+    /// <summary>
+    /// Escapes a string for safe use inside a Mermaid diagram label by replacing
+    /// characters that would break Mermaid's lexer (<c>"</c>, <c>[</c>, <c>]</c>, newlines).
+    /// </summary>
     private static string EscapeMermaid(string? text)
         => (text ?? "").Replace("\"", "'").Replace("[", "(").Replace("]", ")").Replace("\n", " ");
 
+    /// <summary>
+    /// Sanitises a string for use as an HTML <c>id</c> attribute or Mermaid node identifier
+    /// by replacing any character outside <c>[a-zA-Z0-9_]</c> with an underscore.
+    /// </summary>
     private static string SanitizeMermaidId(string id)
         => System.Text.RegularExpressions.Regex.Replace(id, @"[^a-zA-Z0-9_]", "_");
 
+    /// <summary>
+    /// Formats a raw byte count as a human-readable string with an appropriate unit suffix.
+    /// Uses one decimal place for KB / MB / GB to balance precision and readability.
+    /// </summary>
     private static string FormatBytes(long bytes) => bytes switch
     {
         < 1024 => $"{bytes} B",
@@ -1708,9 +1861,9 @@ public class HtmlDashboardGenerator
               responsesHtml += '<span class="dt-resp-desc">'+escHtml(r.description||'')+'</span>';
               if (r.contentType) responsesHtml += '<span class="dt-resp-ct">'+escHtml(r.contentType)+'</span>';
               responsesHtml += '</div>';
-              if (r.schemaJson) {
+              if (r.exampleJson || r.schemaJson) {
                 responsesHtml += '<div class="dt-resp-schema-label">Response Body Schema</div>';
-                responsesHtml += '<pre class="dt-resp-schema">'+escHtml(r.schemaJson)+'</pre>';
+                responsesHtml += '<pre class="dt-resp-schema">'+escHtml(r.exampleJson || r.schemaJson)+'</pre>';
               } else if (r.schema) {
                 responsesHtml += '<div class="dt-resp-schema-label">Type: <code>'+escHtml(r.schema)+'</code></div>';
               }
@@ -1722,7 +1875,24 @@ public class HtmlDashboardGenerator
           // Build trace HTML
           var traceHtml = '<p style="color:#8b949e;font-size:13px">⚠ 未偵測到此 API 的執行路徑。請確認原始碼中有對應的 handler 函式。</p>';
           var logicHtml = '<p style="color:#8b949e;font-size:13px">請先確認執行路徑。</p>';
-          var sqlHtml = '<p style="color:#8b949e;font-size:13px">未偵測到 SQL 語法。</p>';
+          // ORM / DB access detection for richer empty-state message
+          var ormHints = {
+            'gorm': 'GORM', 'sqlalchemy': 'SQLAlchemy', 'activerecord': 'ActiveRecord',
+            'hibernate': 'Hibernate', 'prisma': 'Prisma', 'typeorm': 'TypeORM',
+            'sequelize': 'Sequelize', 'mongoose': 'Mongoose (MongoDB)',
+            'ent': 'ent (Go)', 'bun': 'bun (Go)', 'sqlboiler': 'SQLBoiler'
+          };
+          var detectedOrm = trace && trace.steps && trace.steps.length > 0
+            ? (function() {
+                var files = trace.steps.map(function(s){ return (s.file||'').toLowerCase(); }).join(' ');
+                for (var k in ormHints) { if (files.indexOf(k) !== -1) return ormHints[k]; }
+                return null;
+              })()
+            : null;
+          var sqlHtml = detectedOrm
+            ? '<p style="color:#8b949e;font-size:13px">ℹ 未偵測到原生 SQL。此端點可能透過 <strong style="color:#e6edf3">'
+                + escHtml(detectedOrm) + '</strong> ORM 存取資料庫。</p>'
+            : '<p style="color:#8b949e;font-size:13px">未偵測到 SQL 語法。</p>';
 
           if (trace && trace.steps && trace.steps.length > 0) {
             // Build HTML flow diagram for execution trace
@@ -1811,7 +1981,7 @@ public class HtmlDashboardGenerator
               sqlHtml += '<pre class="dt-sql-code">'+escHtml(q.rawSql)+'</pre>';
               // Composed SQL (with param annotations)
               if (q.composedSql && q.composedSql !== q.rawSql) {
-                sqlHtml += '<div style="padding:8px 16px 2px;font-size:11px;color:#d29922;text-transform:uppercase">組合後可執行 SQL（含參數標註）</div>';
+                sqlHtml += '<div style="padding:8px 16px 2px;font-size:11px;color:#d29922;text-transform:uppercase">組合後可執行 SQL（含參數佔位值）</div>';
                 sqlHtml += '<pre class="dt-sql-code" style="border-top:1px solid var(--border)">'+escHtml(q.composedSql)+'</pre>';
               }
               sqlHtml += '</div>';
@@ -1851,8 +2021,13 @@ public class HtmlDashboardGenerator
             + '<\/script>'
             + '</body></html>';
 
-          var w = window.open('', '_blank');
-          if (w) { w.document.open(); w.document.write(html); w.document.close(); }
+          // Use Blob URL instead of document.write — avoids the deprecated API and
+          // prevents DOM-clobbering / CSP bypass issues from cross-window document manipulation.
+          var blob = new Blob([html], {type: 'text/html'});
+          var blobUrl = URL.createObjectURL(blob);
+          var w = window.open(blobUrl, '_blank');
+          // Revoke the object URL after the window has had time to load it
+          if (w) { w.addEventListener('load', function(){ URL.revokeObjectURL(blobUrl); }); }
         }
 
         function getDtStyles() {
@@ -1950,7 +2125,7 @@ public class HtmlDashboardGenerator
           html += '</div>';
           if (c.ports && c.ports.length) {
             html += '<h4 style="margin:12px 0 8px;font-size:13px">Port 映射</h4><table class="data-table"><thead><tr><th>Host</th><th>Container</th><th>協定</th></tr></thead><tbody>';
-            c.ports.forEach(function(p) { html += '<tr><td>' + p.hostPort + '</td><td>' + p.containerPort + '</td><td>' + escHtml(p.protocol) + '</td></tr>'; });
+            c.ports.forEach(function(p) { html += '<tr><td>' + escHtml(String(p.hostPort)) + '</td><td>' + escHtml(String(p.containerPort)) + '</td><td>' + escHtml(p.protocol) + '</td></tr>'; });
             html += '</tbody></table>';
           }
           if (c.envVariables && c.envVariables.length) {

@@ -126,7 +126,7 @@ public class AnalysisOrchestrator
         // 4. Copilot Instructions
         var copilotInstructions = allFiles.FirstOrDefault(f =>
             f.RelativePath.Contains(".github/copilot-instructions.md", StringComparison.OrdinalIgnoreCase));
-        if (copilotInstructions != null)
+        if (copilotInstructions != null && copilotInstructions.SizeBytes < 512 * 1024)
         {
             data.Project.CopilotInstructions = File.ReadAllText(copilotInstructions.AbsolutePath);
             Log("[RID] 已讀取 copilot-instructions.md");
@@ -174,6 +174,14 @@ public class AnalysisOrchestrator
 
         data.Tests         = testsTask.Result;
         Log($"[RID] 測試：{data.Tests.TotalTestCount} 個");
+
+        // Makefile analysis runs after file scan (requires allFiles list)
+        Log("[RID] 分析 Makefile...");
+        var makefileAnalyzer = new MakefileAnalyzer();
+        data.Makefile = makefileAnalyzer.Analyze(repoPath, allFiles);
+        Log(data.Makefile.Exists
+            ? $"[RID] 找到 Makefile：{data.Makefile.Targets.Count} 個指令"
+            : $"[RID] 未找到 Makefile，已自動生成 {data.Makefile.Targets.Count} 個指令");
 
         // ApiTraceAnalyzer runs AFTER the concurrent batch because it requires data.ApiEndpoints
         // (produced by SwaggerAnalyzer above).  Including it in the Task.WhenAll group would
