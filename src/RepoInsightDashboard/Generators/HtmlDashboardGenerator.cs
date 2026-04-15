@@ -136,7 +136,7 @@ public class HtmlDashboardGenerator
         sb.AppendLine("<body>");
         sb.AppendLine(BuildNavbar(data));
         sb.AppendLine("<div class=\"layout\">");
-        sb.AppendLine(BuildSidebar());
+        sb.AppendLine(BuildSidebar(data));
         sb.AppendLine("<main class=\"main-content\" id=\"main-content\">");
         sb.AppendLine(BuildOverviewSection(data));
         sb.AppendLine(BuildLanguageSection(data));
@@ -187,7 +187,19 @@ public class HtmlDashboardGenerator
         </nav>
         """;
 
-    private string BuildSidebar() => """
+    private string BuildSidebar(DashboardData data)
+    {
+        // The Copilot Instructions nav item is only rendered when the repo
+        // actually contains a .github/copilot-instructions.md file.
+        var copilotNavItem = !string.IsNullOrEmpty(data.Project.CopilotInstructions)
+            ? """
+                <a href="#section-copilot-instructions" class="nav-item" data-section="copilot-instructions">
+                  <span class="nav-icon">🤖</span> Copilot Instructions
+                </a>
+            """
+            : "";
+
+        return $"""
         <aside class="sidebar" id="sidebar" role="complementary">
           <nav class="sidebar-nav" aria-label="區塊導航">
             <a href="#section-overview" class="nav-item active" data-section="overview">
@@ -229,9 +241,11 @@ public class HtmlDashboardGenerator
             <a href="#section-makefile" class="nav-item" data-section="makefile">
               <span class="nav-icon">⚙️</span> Makefile 指令區
             </a>
+            {copilotNavItem}
           </nav>
         </aside>
         """;
+    }
 
     /// <summary>
     /// Builds a collapsible dashboard section with an accessible heading and a
