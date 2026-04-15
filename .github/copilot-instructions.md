@@ -54,3 +54,41 @@ Specs: OpenAPI/Swagger, Dockerfile, docker-compose
 rid analyze /path/to/repo [--copilot-token TOKEN] [--output PATH] [--verbose] [--theme light|dark]
 ```
 `--copilot-token` enables optional GitHub Copilot API semantic analysis via `CopilotSemanticAnalyzer`.
+
+## Code Style
+
+- All `public` types and members require XML doc comments (`<summary>`, `<param>`, `<returns>`).
+- Namespaces mirror folder paths: `RepoInsightDashboard.Analyzers`, `.Services`, `.Models`, `.Generators`.
+- One concern per file; file name matches the primary type it defines.
+- Use C# 12 features: top-level statements, records for immutable models, nullable reference types.
+
+## Locale & Language
+
+- CLI help text and user-facing strings: **Traditional Chinese (繁體中文)**.
+- Source code comments and XML docs: **English**.
+- README: Chinese; technical specs (`docs/SPEC.md`): English.
+
+## Output & Error Handling
+
+- Analysis results → `Console.Out` (stdout).
+- Diagnostics, progress, and errors → `Console.Error` (stderr). Never mix them (CWE-200).
+- Use `Console.ForegroundColor` / `Console.ResetColor` for colored terminal output; never ANSI escape codes directly.
+
+## Concurrency Model
+
+`AnalysisOrchestrator` runs in three phases:
+1. **Serial** — file scan, language detection, `.env` loading.
+2. **Concurrent** (`Task.WhenAll`) — `DependencyAnalyzer`, `DockerAnalyzer`, `SwaggerAnalyzer`, `EnvFileAnalyzer`, `TestAnalyzer`; then serial `ApiTraceAnalyzer` (depends on Swagger output).
+3. **Concurrent** — three parallel GitHub Copilot API calls (summary, design patterns, security risks).
+
+New analyzers that have no cross-dependencies should be added to Phase 2.
+
+## GitHub Copilot API Integration
+
+- Token sourced from `--copilot-token` CLI flag or `COPILOT_TOKEN` env var (`.env` file).
+- Allowed model names: `gpt-4o` (default), `gpt-4o-mini`, `gpt-4.1` — validated via `FromAmong`.
+
+## Testing
+
+- Tests live in `RepoInsightDashboard.Tests`; the project references the main project directly (no mocking layer by default).
+- Coverage collected via `coverlet.collector` — run `dotnet test` to generate reports.
