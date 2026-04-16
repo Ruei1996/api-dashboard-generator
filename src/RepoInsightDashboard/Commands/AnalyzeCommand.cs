@@ -1,11 +1,56 @@
+// ============================================================
+// AnalyzeCommand.cs — System.CommandLine "analyze" sub-command
+// ============================================================
+// Architecture: static command-builder; wires CLI arguments/options to
+//   AnalysisOrchestrator and the two generators (HTML + JSON).
+//
+// CLI surface:
+//   rid analyze <repo-path>
+//       [--output/-o <dir>]
+//       [--theme dark|light|auto]
+//       [--no-ai]
+//       [--verbose/-v]
+//       [--copilot-token <token>]  ← DEPRECATED (CWE-214: token visible in ps aux)
+//
+// Security (CWE-22 — Path Traversal):
+//   The derived output file paths (projectName + branchName) are canonicalised via
+//   Path.GetFullPath and validated against the resolved output directory before any
+//   File.WriteAll call, preventing an attacker-controlled repository name from
+//   escaping the intended output location (e.g. "../../etc/cron.d/evil").
+//
+// Security (CWE-214 — Sensitive Information in Process Environment):
+//   --copilot-token is deprecated; tokens passed on the CLI appear in process
+//   tables (ps aux) and shell history.  Users are redirected to the
+//   GITHUB_COPILOT_TOKEN environment variable or ~/.config/rid/.env instead.
+// ============================================================
+
 using System.CommandLine;
 using RepoInsightDashboard.Generators;
 using RepoInsightDashboard.Services;
 
 namespace RepoInsightDashboard.Commands;
 
+/// <summary>
+/// Builds and registers the <c>analyze</c> sub-command for the <c>rid</c> CLI tool.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Call <see cref="Build"/> once at startup to get a <see cref="Command"/> that can be
+/// added to the root <see cref="System.CommandLine.RootCommand"/>.  All real work is
+/// delegated to <see cref="Services.AnalysisOrchestrator"/>, which runs the analysis
+/// pipeline and returns a fully-populated <see cref="Models.DashboardData"/>.
+/// </para>
+/// </remarks>
 public static class AnalyzeCommand
 {
+    /// <summary>
+    /// Creates and returns a configured <see cref="Command"/> named <c>analyze</c>
+    /// with all its arguments, options, and handler wired up.
+    /// </summary>
+    /// <returns>
+    /// A ready-to-use <see cref="Command"/> that can be attached to a
+    /// <see cref="System.CommandLine.RootCommand"/>.
+    /// </returns>
     public static Command Build()
     {
         var pathArg = new Argument<DirectoryInfo>(
@@ -57,6 +102,21 @@ public static class AnalyzeCommand
         return cmd;
     }
 
+    /// <summary>
+    /// Runs the full analysis pipeline, writes the HTML and JSON output files,
+    /// and attempts to open the HTML file in the default browser.
+    /// </summary>
+    /// <param name="repoDir">Repository root directory (validated to exist before delegation).</param>
+    /// <param name="outputDir">
+    /// Target output directory; defaults to <c>~/Downloads/api-dashboard-result/</c>
+    /// when <c>null</c>.
+    /// </param>
+    /// <param name="copilotToken">
+    /// Optional Copilot API token.  <c>null</c> when <c>--no-ai</c> is set or when the
+    /// flag was not supplied and no env var is present.
+    /// </param>
+    /// <param name="theme">Dashboard colour theme name ("dark", "light", or "auto").</param>
+    /// <param name="verbose">When <c>true</c>, writes detailed progress lines to stdout.</param>
     private static async Task RunAsync(
         DirectoryInfo repoDir,
         DirectoryInfo? outputDir,
@@ -171,12 +231,28 @@ public static class AnalyzeCommand
         }
     }
 
+    /// <summary>
+    /// Replaces characters that are illegal in file names (including platform-independent
+    /// extras like <c>:</c>, <c>/</c>, <c>*</c>, <c>?</c>) with underscores.
+    /// </summary>
+    /// <param name="name">Raw string to sanitise (e.g. a branch name or project name).</param>
+    /// <returns>
+    /// A file-system-safe version of <paramref name="name"/> with invalid characters
+    /// replaced by <c>_</c> and leading/trailing underscores stripped.
+    /// </returns>
     private static string SanitizeFileName(string name)
     {
         var invalid = Path.GetInvalidFileNameChars().Union([':', '/', '\\', '*', '?']).ToArray();
         return string.Concat(name.Select(c => invalid.Contains(c) ? '_' : c)).Trim('_');
     }
 
+    /// <summary>
+    /// Attempts to open <paramref name="filePath"/> in the system's default browser.
+    /// Uses <c>open</c> on macOS and <c>xdg-open</c> on Linux.
+    /// Failures are silently swallowed because this is a convenience feature;
+    /// the output files have already been written successfully at this point.
+    /// </summary>
+    /// <param name="filePath">Absolute path to the generated HTML dashboard file.</param>
     private static void TryOpenBrowser(string filePath)
     {
         try

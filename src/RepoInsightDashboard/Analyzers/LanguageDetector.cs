@@ -1,3 +1,20 @@
+// ============================================================
+// LanguageDetector.cs — File-extension to language name/colour mapper
+// ============================================================
+// Architecture: static utility class — all methods are thread-safe and allocate no state.
+//   Used by FileScanner to annotate FileNode.Language at scan time, and by
+//   HtmlDashboardGenerator to render the language breakdown donut chart.
+//
+// Language data source:
+//   Extension → (Name, HexColour) pairs mirror the GitHub Linguist colour palette
+//   so that the dashboard chart matches what developers see on GitHub.
+//
+// Usage:
+//   string? lang  = LanguageDetector.GetLanguage(".cs");       // → "C#"
+//   string  color = LanguageDetector.GetColor(".cs");          // → "#178600"
+//   List<LanguageInfo> stats = LanguageDetector.Detect(files); // aggregated stats
+// ============================================================
+
 using RepoInsightDashboard.Models;
 
 namespace RepoInsightDashboard.Analyzers;

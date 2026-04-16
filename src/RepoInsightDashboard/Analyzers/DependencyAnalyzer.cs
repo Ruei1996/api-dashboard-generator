@@ -1,3 +1,26 @@
+// ============================================================
+// DependencyAnalyzer.cs — Multi-ecosystem package manifest parser
+// ============================================================
+// Architecture: stateless service class; instantiated once per analyze run.
+// Supported manifest formats:
+//   Node.js  → package.json (dependencies + devDependencies)
+//   Go       → go.mod (require directives)
+//   Python   → requirements.txt, Pipfile, pyproject.toml, setup.py
+//   Rust     → Cargo.toml ([dependencies] + [dev-dependencies])
+//   JVM      → pom.xml (Maven), build.gradle / build.gradle.kts (Gradle)
+//   Ruby     → Gemfile, *.gemspec
+//   PHP      → composer.json
+//   Dart     → pubspec.yaml
+//   Elixir   → mix.exs
+//   Swift    → Package.swift
+//   .NET     → *.csproj, *.vbproj, *.fsproj (PackageReference items)
+//
+// Usage:
+//   var analyzer = new DependencyAnalyzer();
+//   var packages = analyzer.Analyze(allFiles);
+//   var graph    = analyzer.BuildGraph(packages, projectInfo);
+// ============================================================
+
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;

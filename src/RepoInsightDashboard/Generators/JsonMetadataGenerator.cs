@@ -1,10 +1,61 @@
+// ============================================================
+// JsonMetadataGenerator.cs — Machine-readable JSON export of analysis results
+// ============================================================
+// Architecture: stateless generator; takes a fully-populated DashboardData and
+//   produces a compact JSON file suitable for CI badge generators, custom tooling,
+//   or archival.
+//
+// Security:
+//   Sensitive environment-variable values are projected to "***" before
+//   serialisation — the raw masked value "***masked***" from EnvFileAnalyzer is
+//   further shortened for compactness.  The full host path (Meta.RepoPath) is
+//   replaced with its basename (directory name only) to avoid leaking machine
+//   filesystem layout in shared reports.
+//
+// Usage:
+//   var gen  = new JsonMetadataGenerator();
+//   var json = gen.Generate(dashboardData);
+//   File.WriteAllText("metadata.json", json, Encoding.UTF8);
+// ============================================================
+
 using Newtonsoft.Json;
 using RepoInsightDashboard.Models;
 
 namespace RepoInsightDashboard.Generators;
 
+/// <summary>
+/// Serialises a <see cref="DashboardData"/> snapshot into a compact, indented JSON file
+/// that third-party tools (CI badges, custom dashboards, scripts) can consume directly.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The output schema is intentionally a subset of <see cref="DashboardData"/>: only the
+/// fields that are stable and machine-useful are included.  Private internal fields
+/// (e.g. <c>AbsolutePath</c>, raw file trees) are omitted to keep the file small and
+/// avoid leaking host filesystem information.
+/// </para>
+/// <para>
+/// Sensitive environment-variable values are masked to <c>"***"</c> (three asterisks)
+/// before serialisation, matching the masking already applied by
+/// <see cref="Analyzers.EnvFileAnalyzer"/>.
+/// </para>
+/// </remarks>
 public class JsonMetadataGenerator
 {
+    /// <summary>
+    /// Generates a JSON string from the supplied <see cref="DashboardData"/> snapshot.
+    /// </summary>
+    /// <param name="data">
+    /// Fully-populated dashboard data produced by <see cref="Services.AnalysisOrchestrator"/>.
+    /// The object is read-only from the generator's perspective; no mutations are made.
+    /// </param>
+    /// <returns>
+    /// A pretty-printed (indented) JSON string with <c>null</c> values omitted.
+    /// The top-level keys are: <c>meta</c>, <c>languages</c>, <c>dependencies</c>,
+    /// <c>apiEndpoints</c>, <c>apiTraces</c>, <c>containers</c>, <c>envVariables</c>,
+    /// <c>copilotSummary</c>, <c>designPatterns</c>, <c>securityRisks</c>,
+    /// <c>startupSequence</c>, and <c>dockerfile</c>.
+    /// </returns>
     public string Generate(DashboardData data)
     {
         var metadata = new
@@ -15,7 +66,9 @@ public class JsonMetadataGenerator
                 toolVersion = data.Meta.ToolVersion,
                 projectName = data.Meta.ProjectName,
                 branch = data.Meta.Branch,
-                repoPath = Path.GetFileName(data.Meta.RepoPath) // only the dir name, not the full host path
+                // Only the directory basename is included — not the full host path —
+                // to avoid leaking machine filesystem layout in shared reports.
+                repoPath = Path.GetFileName(data.Meta.RepoPath)
             },
             languages = data.Project.Languages.Select(l => new
             {

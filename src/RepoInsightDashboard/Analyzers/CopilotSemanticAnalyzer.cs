@@ -37,6 +37,39 @@ using RepoInsightDashboard.Models;
 
 namespace RepoInsightDashboard.Analyzers;
 
+/// <summary>
+/// Provides AI-powered and local-heuristic semantic analysis of a scanned repository,
+/// covering project summaries, architectural design-pattern detection, and security risk reports.
+/// </summary>
+/// <remarks>
+/// <para>
+/// When a valid <c>GITHUB_COPILOT_TOKEN</c> is available, each of the three analysis methods
+/// sends a structured prompt to <c>api.githubcopilot.com/chat/completions</c> and parses the
+/// JSON response.  When <see cref="IsAvailable"/> is <c>false</c>, every method falls back to
+/// a fast, fully-offline implementation with no network calls.
+/// </para>
+/// <para>
+/// <b>Security model:</b>
+/// <list type="bullet">
+///   <item>
+///     <b>Consent warning (CWE-359)</b> — the first network call displays a 5-second countdown
+///     so users can abort before source code is sent to the external AI API.
+///   </item>
+///   <item>
+///     <b>Token scope (CWE-522)</b> — only <c>GITHUB_COPILOT_TOKEN</c> is accepted.
+///     Using the broad <c>GITHUB_TOKEN</c> (which carries repo write access) is explicitly rejected.
+///   </item>
+///   <item>
+///     <b>Model allowlist (CWE-20)</b> — only values from <c>KnownModels</c> are forwarded
+///     to the API, preventing an injected <c>COPILOT_MODEL</c> from triggering unexpected behaviour.
+///   </item>
+///   <item>
+///     <b>MaxDepth=32 (CWE-674)</b> — untrusted AI JSON responses are deserialised with a
+///     max recursion depth of 32 to prevent stack overflow via deeply-nested payloads.
+///   </item>
+/// </list>
+/// </para>
+/// </remarks>
 public class CopilotSemanticAnalyzer
 {
     // Shared HttpClient — creating one per request exhausts socket connections.
@@ -267,6 +300,17 @@ public class CopilotSemanticAnalyzer
         return risks.OrderBy(r => r.Priority).ThenBy(r => r.Title).ToList();
     }
 
+    /// <summary>
+    /// Translates an API description string from English to Traditional Chinese using
+    /// the Copilot API.  Returns the original string unchanged when no token is configured
+    /// (<see cref="IsAvailable"/> is <c>false</c>) or when the input is null/empty.
+    /// </summary>
+    /// <param name="description">The English API description text to translate.</param>
+    /// <param name="ct">Cancellation token propagated to the HTTP call.</param>
+    /// <returns>
+    /// Translated Traditional Chinese string, or the original <paramref name="description"/>
+    /// if translation is unavailable or fails.
+    /// </returns>
     public async Task<string> TranslateApiDescriptionAsync(string description, CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(description)) return description;

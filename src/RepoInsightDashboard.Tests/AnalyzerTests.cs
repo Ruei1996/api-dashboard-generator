@@ -1,3 +1,21 @@
+// ============================================================
+// AnalyzerTests.cs — Integration tests for all major analyzer and generator classes
+// ============================================================
+// Architecture: xUnit test project; each public class is a test suite for
+//   one corresponding production class.
+//
+// Test suites:
+//   GitignoreParserTests   — default ignored paths + custom .gitignore rules
+//   LanguageDetectorTests  — extension → language name mapping + percentage calc
+//   DependencyAnalyzerTests — package.json and *.csproj parsing
+//   EnvFileAnalyzerTests   — .env key-value extraction + sensitive-value masking
+//   HtmlDashboardGeneratorTests — HTML output structure validation
+//   JsonMetadataGeneratorTests  — JSON output key presence validation
+//
+// All tests that write to disk use Path.GetTempPath() and clean up in finally blocks
+// to ensure no test artefacts remain on the CI runner between runs.
+// ============================================================
+
 using System.IO;
 using RepoInsightDashboard.Analyzers;
 using RepoInsightDashboard.Generators;

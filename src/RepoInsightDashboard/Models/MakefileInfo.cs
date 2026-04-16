@@ -1,3 +1,11 @@
+// ============================================================
+// MakefileInfo.cs — Makefile content model
+// ============================================================
+// Architecture: plain data class; populated by MakefileAnalyzer.
+//   Either holds the verbatim content of an existing Makefile, or the
+//   synthesised content when no Makefile was found in the repository.
+// ============================================================
+
 namespace RepoInsightDashboard.Models;
 
 /// <summary>

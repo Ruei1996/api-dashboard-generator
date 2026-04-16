@@ -1,3 +1,24 @@
+// ============================================================
+// TestAnalyzer.cs — Multi-language test file discovery and parser
+// ============================================================
+// Architecture: stateless service class; instantiated once per analyze run.
+// Supported test frameworks:
+//   Go      → testing.T-based tests (*_test.go)
+//   Python  → pytest, unittest (test_*.py, *_test.py)
+//   JS/TS   → Jest, Vitest, Mocha (*.test.ts, *.spec.ts, *.test.js, *.spec.js)
+//   Java/Kotlin → JUnit 4/5 (@Test annotation)
+//   C#      → xUnit, NUnit, MSTest ([Fact], [Test], [TestMethod])
+//   Ruby    → RSpec (describe/it blocks)
+//   PHP     → PHPUnit (test* methods)
+//   Rust    → #[test] attribute
+//
+// Classification:
+//   Tests are tagged unit / integration / acceptance based on naming conventions:
+//     integration → paths containing /integration/, /e2e/, /functional/
+//     acceptance  → paths containing /acceptance/, /bdd/
+//     unit        → everything else (default)
+// ============================================================
+
 using System.Text.RegularExpressions;
 using RepoInsightDashboard.Models;
 

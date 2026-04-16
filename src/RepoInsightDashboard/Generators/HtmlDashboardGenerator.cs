@@ -2255,6 +2255,23 @@ public class HtmlDashboardGenerator
           setTimeout(function(){ URL.revokeObjectURL(blobUrl); }, 5000);
         }
 
+        /**
+         * Returns all CSS required by the API detail popup window as a single concatenated string.
+         *
+         * The styles are built here (rather than in a separate stylesheet) so that the popup
+         * can be opened as a Blob URL — a fully self-contained HTML document with no external
+         * resource dependencies.  Blob URLs have an opaque origin and cannot load external CSS.
+         *
+         * Sections covered:
+         *   1. CSS custom properties (dark-theme colour palette, font stack)
+         *   2. Base reset and body styles
+         *   3. Sticky nav-bar (method badge, path, tag)
+         *   4. Tab bar and panel layout
+         *   5. Data tables, response cards, trace flow diagram
+         *   6. Interactive SQL Builder widget (.dt-sqlb-*)
+         *
+         * @returns {string} Concatenated minified CSS string for the detail popup.
+         */
         function getDtStyles() {
           return ':root{--bg:#0d1117;--bg2:#161b22;--card:#21262d;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;--green:#3fb950;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--mono:"SFMono-Regular",Consolas,monospace}'
             + '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}'
