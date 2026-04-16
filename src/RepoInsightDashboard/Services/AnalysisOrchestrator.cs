@@ -240,7 +240,11 @@ public class AnalysisOrchestrator
                     Log($"[RID] 最後提交：{last.MessageShort} by {last.Author.Name}");
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            // LibGit2Sharp throws for non-git directories; log at verbose level and continue.
+            Log($"[RID][WARN] 無法讀取 Git 資訊：{ex.Message}");
+        }
         return (name, branch);
     }
 

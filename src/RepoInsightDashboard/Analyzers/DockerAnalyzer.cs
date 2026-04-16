@@ -46,11 +46,20 @@ public class DockerAnalyzer
 {
     // Keywords matching EnvFileAnalyzer.SensitiveKeywords — Dockerfile ENV values
     // whose keys contain these terms are masked to "***masked***" in output.
+    // ── 2025-05 expansion: added connection-string patterns (CWE-312 / OWASP A02) ──
     private static readonly string[] _sensitiveEnvKeywords =
     [
         "password", "passwd", "secret", "key", "token", "credential",
-        "api_key", "apikey", "private", "auth", "cert", "pass"
+        "api_key", "apikey", "private", "auth", "cert", "pass",
+        "url", "uri", "dsn", "connection", "connstr", "jdbc"
     ];
+
+    // Value-level URL credential detector — matches "scheme://user:password@host".
+    // Supplements the key-name check for variables like DATABASE_URL whose key name
+    // doesn't include "password" but whose value contains embedded credentials.
+    private static readonly System.Text.RegularExpressions.Regex _dockerUrlCredentialPattern =
+        new(@"://[^:@/\s]+:[^:@/\s]{4,}@",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// Parses a Dockerfile line-by-line and extracts its base image, multi-stage build
@@ -110,10 +119,11 @@ public class DockerAnalyzer
                         var envParts = parts[1].Split('=', 2);
                         var envKey = envParts[0].Trim();
                         var rawVal = envParts.Length > 1 ? envParts[1].Trim() : "";
-                        // Mask values for keys that look like credentials/secrets,
-                        // consistent with EnvFileAnalyzer's masking behaviour.
+                        // Two-gate sensitive check — matches EnvFileAnalyzer behaviour (CWE-312 / OWASP A02):
+                        // Gate 1: key-name substring match; Gate 2: value-level URL credential pattern.
                         var isSensitive = _sensitiveEnvKeywords.Any(kw =>
-                            envKey.Contains(kw, StringComparison.OrdinalIgnoreCase));
+                            envKey.Contains(kw, StringComparison.OrdinalIgnoreCase))
+                            || _dockerUrlCredentialPattern.IsMatch(rawVal);
                         info.EnvVars.Add(new EnvVariable
                         {
                             Key = envKey,

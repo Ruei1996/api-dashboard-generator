@@ -70,6 +70,11 @@ public class ApiTraceAnalyzer
     private readonly Dictionary<string, string[]> _fileLineCache =
         new(StringComparer.Ordinal);
 
+    // Go struct body index: structName (case-insensitive) -> body text between { }.
+    // Built once at construction from all .go files; FindGoStructDefinition is O(1).
+    private readonly Dictionary<string, string> _structBodyIndex =
+        new(StringComparer.OrdinalIgnoreCase);
+
     // ── Compiled static regexes (instantiated once per AppDomain) ─────────────
     // Using RegexOptions.Compiled so the JIT emits native code for the pattern.
     private static readonly Regex RxGoFunc =
@@ -113,6 +118,53 @@ public class ApiTraceAnalyzer
     private static readonly Regex RxGoRawLiteral =
         new(@"^`([^`]*)`$", RegexOptions.Compiled);
 
+    // ── Additional compiled regexes for hot-path helpers ─────────────────────
+    // These replace Regex.Xxx(string, string) static overloads that bypass the
+    // 15-entry MRU cache and allocate a new Regex object on every invocation.
+
+    // ParseSqlcFile — matches sqlc query blocks (-- name: FuncName :operation)
+    private static readonly Regex RxSqlcBlock =
+        new(@"--\s*name:\s*(\w+)\s*:(\w+)\s*\n([\s\S]+?)(?=--\s*name:|$)",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // Go struct definitions — populated once at construction into _structBodyIndex
+    private static readonly Regex RxGoStructDef =
+        new(@"type\s+(\w+)\s+struct\s*\{([^}]+)\}", RegexOptions.Compiled);
+
+    // CollectStoreCallsRecursive — receiver method pattern (compiled once per call, not per line)
+    // NOTE: not a static field because the pattern is interpolated with helperName.
+    // Used as a local compiled Regex to avoid re-compiling inside the per-line loop.
+
+    // TryParseGinEchoChiRoute
+    private static readonly Regex RxGinRoute =
+        new(@"(?:router|r|e|g|api|v\d+|group)\.(GET|POST|PUT|DELETE|PATCH|Get|Post|Put|Delete|Patch)\s*\(\s*""([^""]+)""\s*,\s*(?:\w+\.)?(\w+)\s*[,)]",
+            RegexOptions.Compiled);
+
+    // ExtractGoStoreCalls
+    private static readonly Regex RxGoStoreCall =
+        new(@"(?:\w+\.\w*store|\bstore\b|\bq\b|\bdb\b|\w+\.\w*db|\w+\.\w*repo|\w+\.\w*quer)\s*\.\s*([A-Z]\w+)\s*\(",
+            RegexOptions.Compiled);
+
+    // ExtractGoSqlcCalls
+    private static readonly Regex RxGoSqlcCall =
+        new(@"(?:\bq\b|\bqueries\b|\btx\b|\bqtx\b)\s*\.\s*([A-Z]\w+)\s*\(",
+            RegexOptions.Compiled);
+
+    // ExtractGoCalledFunctions
+    private static readonly Regex RxGoExportedCall =
+        new(@"(?:[a-zA-Z_]\w*)\.([A-Z]\w+)\s*\(", RegexOptions.Compiled);
+
+    // FindCSharpActionMethod — HTTP attribute path and method signature
+    private static readonly Regex RxCsAttrPath =
+        new(@"\(""([^""]+)""\)", RegexOptions.Compiled);
+    private static readonly Regex RxCsActionSig =
+        new(@"(?:public|private|protected)(?:\s+(?:async|virtual|override))*\s+\S+\s+(\w+)\s*\(",
+            RegexOptions.Compiled);
+
+    // PathsMatch — normalise path parameters to wildcards
+    private static readonly Regex RxPathParam =
+        new(@"\{[^}]+\}", RegexOptions.Compiled);
+
     /// <summary>
     /// Constructs the analyser and eagerly builds three indexes by scanning all
     /// source files exactly once:
@@ -139,6 +191,7 @@ public class ApiTraceAnalyzer
         _allFiles = allFiles;
         _primaryLanguage = DetectPrimaryLanguage();
         BuildFunctionIndex();
+        BuildStructIndex();
         PreloadSqlQueries();
         BuildRouteHandlerIndex();
     }
@@ -363,10 +416,10 @@ public class ApiTraceAnalyzer
 
     private void ParseSqlcFile(FileNode file)
     {
-        var content = File.ReadAllText(file.AbsolutePath);
-        var matches = Regex.Matches(content,
-            @"--\s*name:\s*(\w+)\s*:(\w+)\s*\n([\s\S]+?)(?=--\s*name:|$)",
-            RegexOptions.IgnoreCase);
+        // Uses GetCachedContent to avoid a second disk read when BuildFunctionIndex
+        // has already populated _fileLineCache for this file (P1-A perf fix).
+        var content = GetCachedContent(file.AbsolutePath);
+        var matches = RxSqlcBlock.Matches(content);
 
         foreach (Match m in matches)
         {
@@ -633,18 +686,23 @@ public class ApiTraceAnalyzer
     }
 
     private string? FindGoStructDefinition(string structName)
+        => _structBodyIndex.TryGetValue(structName, out var body) ? body : null;
+
+    /// <summary>
+    /// Populates <see cref="_structBodyIndex"/> by scanning all .go files once at
+    /// construction time using the pre-compiled <see cref="RxGoStructDef"/> regex.
+    /// Subsequent calls to <see cref="FindGoStructDefinition"/> are O(1) dictionary lookups
+    /// instead of O(F × L) linear scans with per-file Regex allocations.
+    /// </summary>
+    private void BuildStructIndex()
     {
-        foreach (var file in _allFiles.Where(f => !f.IsDirectory && f.Extension == ".go"))
+        foreach (var file in _allFiles.Where(f =>
+            !f.IsDirectory && f.Extension == ".go" && !IsTestFile(f) && !IsGeneratedFile(f)))
         {
-            try
-            {
-                var content = File.ReadAllText(file.AbsolutePath);
-                var m = Regex.Match(content, $@"type\s+{Regex.Escape(structName)}\s+struct\s*\{{([^}}]+)}}");
-                if (m.Success) return m.Groups[1].Value;
-            }
-            catch { }
+            var content = GetCachedContent(file.AbsolutePath);
+            foreach (Match m in RxGoStructDef.Matches(content))
+                _structBodyIndex.TryAdd(m.Groups[1].Value, m.Groups[2].Value);
         }
-        return null;
     }
 
     private static string NormalizeSqlOperation(string hint, string sql)
@@ -1022,12 +1080,16 @@ public class ApiTraceAnalyzer
         {
             if (!visited.Add(helperName)) continue;
 
-            // Find the helper method in the same file (receiver method pattern)
+            // Find the helper method in the same file (receiver method pattern).
+            // Compile the regex ONCE per helper (not once per line) to avoid 500+
+            // Regex allocations on files with many helpers (P1-C perf fix).
             int helperLine = -1;
+            var receiverRx = new Regex(
+                $@"func\s+\([^)]+\)\s+{Regex.Escape(helperName)}\s*\(",
+                RegexOptions.Compiled);
             for (int i = 0; i < allLines.Length; i++)
             {
-                if (Regex.IsMatch(allLines[i],
-                    $@"func\s+\([^)]+\)\s+{Regex.Escape(helperName)}\s*\("))
+                if (receiverRx.IsMatch(allLines[i]))
                 {
                     helperLine = i + 1;
                     break;

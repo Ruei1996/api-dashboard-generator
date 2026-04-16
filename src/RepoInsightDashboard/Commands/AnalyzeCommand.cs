@@ -257,7 +257,11 @@ public static class AnalyzeCommand
     {
         try
         {
-            var url = new Uri(filePath).AbsoluteUri;
+            var uri = new Uri(filePath);
+            // Whitelist: only open file:// URIs that resolve to the expected output path.
+            // Prevents a crafted repo-name from redirecting open/xdg-open to a non-file URL.
+            if (!uri.IsFile) return;
+            var url = uri.AbsoluteUri;
             if (OperatingSystem.IsMacOS())
                 System.Diagnostics.Process.Start("open", url);
             else if (OperatingSystem.IsLinux())

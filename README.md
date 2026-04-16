@@ -4,16 +4,17 @@
 
 ## 功能特色
 
-- **多語言支援**：C#、Go、Java、TypeScript、JavaScript、Python、Rust、Ruby 等
-- **依賴分析**：npm / NuGet / Go Modules / Maven / pip / Cargo
+- **多語言支援**：C#、Go、Java、TypeScript、JavaScript、Python、Rust、Ruby、PHP 等
+- **依賴分析**：npm / NuGet / Go Modules / Maven / Gradle / pip / Poetry / Cargo / Composer / Pub / Mix / Swift PM / Rubygems
 - **Docker 解析**：Dockerfile + docker-compose 架構圖、Port 映射（純 Dockerfile 也能合成服務卡片）
-- **API 洞察**：自動解析 Swagger/OpenAPI，點擊端點開新分頁查看執行路徑、邏輯與 SQL
-- **API Trace**：追蹤 Go API 呼叫鏈（Handler → Service → Repository → SQL）
-- **Call Graph**：函式呼叫關係圖（Mermaid）
-- **環境變數**：自動遮罩敏感值，排除測試 env 檔案
-- **測試分析**：Unit / Integration / Acceptance 測試統計與分類
-- **Copilot 語義分析**：可選，需提供 token
-- **離線 HTML**：單一檔案，所有資源內聯，無需網路
+- **API 洞察**：自動解析 Swagger/OpenAPI 3.x / GraphQL schema / gRPC proto，點擊端點查看參數、回應 Schema 與 SQL Trace
+- **API Trace**：追蹤多語言 API 呼叫鏈（Handler → Service → Repository → SQL），支援 Go / C# / Python / Java / TypeScript / PHP / Ruby
+- **環境變數**：自動遮罩敏感值（password / token / secret / key 等），排除測試 env 檔案
+- **Makefile**：讀取現有 Makefile 或依偵測到的語言/工具自動生成
+- **測試分析**：Unit / Integration / Acceptance 測試統計與分類，Mock 檔案清單
+- **安全分析**：七項 OWASP Top 10 靜態 Regex 掃描 + 可選 Copilot AI 深度審查
+- **Copilot 語義分析**：可選，需提供 `GITHUB_COPILOT_TOKEN`；無 token 時使用本地 fallback
+- **離線 HTML**：單一檔案，所有 CSS / JS 內聯，無需網路
 
 ## 安裝
 
@@ -92,20 +93,20 @@ rid analyze . --theme light
 
 | 區塊 | 功能 |
 |------|------|
-| 概覽 | 統計卡片、AI 摘要、設計模式、安全風險 |
-| 語言分佈 | 圓餅圖 + 橫條圖 |
-| 依賴關係圖 | Mermaid 圖表 + 套件列表 |
-| 函式呼叫圖 | 層次呼叫關係（Mermaid） |
-| API 端點 | 可篩選表格，點擊開新頁查看詳細資訊 |
-| API 詳細頁 | 概覽 / 執行路徑（時序圖）/ 執行邏輯 / SQL 語法 |
-| Docker 架構 | 拓撲圖 + 服務卡片（支援純 Dockerfile） |
-| Port 映射 | 服務/Host/Container Port 對照 |
-| 啟動流程 | 依賴順序排列 |
-| 環境變數 | 敏感值遮罩，點擊顯示，排除測試環境檔案 |
+| 概覽 | 統計卡片（檔案數、語言數、API 端點數、容器數）、AI 摘要、設計模式 |
+| 語言分佈 | SVG 環形圖 + 橫條圖（GitHub Linguist 色系） |
+| 依賴關係圖 | RidGraph SVG 依賴圖 + 套件列表（含 ecosystem badge） |
+| API 端點 | 可篩選表格；點擊展開 Detail Panel（總覽 / SQL 語法 / 執行路徑三個頁籤） |
+| Docker 架構 | 拓撲圖 + 服務卡片（支援純 Dockerfile 合成） |
+| Port 映射 | 服務 / Host Port / Container Port / 協議對照表 |
+| 啟動流程 | 依 depends_on 拓撲排序的啟動順序 |
+| 環境變數 | 敏感值遮罩，點擊 value 欄位顯示/隱藏，排除測試環境檔案 |
 | 單元測試 | 測試統計、分類清單、Mock 列表 |
 | 整合/驗收測試 | 測試統計、分類清單 |
-| 檔案樹 | 互動折疊樹狀圖 |
-| 安全分析 | 風險等級分類（critical / warning / info） |
+| 檔案樹 | 互動折疊樹狀圖（含語言標籤與檔案大小） |
+| 安全分析 | OWASP Top 10 風險等級分類（critical → info 排序） |
+| Makefile | 完整 Makefile 原文或自動生成的指令集（含 target 清單） |
+| Copilot Instructions | `.github/copilot-instructions.md` 全文（僅在檔案存在時顯示） |
 
 ## 讓 AI 閱讀分析結果
 
@@ -138,28 +139,36 @@ dotnet pack -c Release -o /tmp/rid-nupkg && dotnet tool update -g --add-source /
 ```
 src/RepoInsightDashboard/
 ├── Analyzers/
+│   ├── IAnalyzer.cs            # 分析器泛型介面 IAnalyzer<TResult>
 │   ├── ApiTraceAnalyzer.cs     # 追蹤 API 執行路徑（Handler→Service→Repo→SQL）
-│   ├── CallGraphAnalyzer.cs    # 函式呼叫圖分析
-│   ├── DependencyAnalyzer.cs   # 依賴套件分析
-│   ├── DockerAnalyzer.cs       # Docker / docker-compose 解析
-│   ├── EnvFileAnalyzer.cs      # 環境變數提取
-│   ├── FileScanner.cs          # 檔案掃描（支援 .gitignore）
-│   ├── GitignoreParser.cs      # .gitignore 規則解析
-│   ├── LanguageDetector.cs     # 程式語言識別
-│   ├── SwaggerAnalyzer.cs      # OpenAPI/Swagger 解析
-│   └── TestAnalyzer.cs         # 測試檔案分析
+│   ├── CopilotSemanticAnalyzer.cs  # GitHub Copilot AI 語義摘要、設計模式與安全分析
+│   ├── DependencyAnalyzer.cs   # 多生態系套件管理檔案解析
+│   ├── DockerAnalyzer.cs       # Dockerfile / docker-compose 解析，ENV 遮罩
+│   ├── EnvFileAnalyzer.cs      # .env 環境變數提取，敏感值自動遮罩
+│   ├── FileScanner.cs          # 遞迴掃描，整合 .gitignore，符號連結防逃逸
+│   ├── GitignoreParser.cs      # .gitignore 規則解析（MAF Pattern Matching）
+│   ├── LanguageDetector.cs     # 程式語言識別（GitHub Linguist 色系）
+│   ├── MakefileAnalyzer.cs     # Makefile 讀取或依工具/語言自動生成
+│   ├── SwaggerAnalyzer.cs      # OpenAPI / GraphQL / gRPC proto 解析
+│   └── TestAnalyzer.cs         # Unit / Integration / Acceptance 測試探索
 ├── Generators/
-│   └── HtmlDashboardGenerator.cs  # HTML Dashboard 生成
+│   ├── HtmlDashboardGenerator.cs   # 生成單一自包含 HTML Dashboard
+│   └── JsonMetadataGenerator.cs    # 生成 JSON 元資料（供 CI / AI 工具消費）
 ├── Models/
-│   ├── ApiTrace.cs             # API 追蹤資料模型
-│   ├── DashboardData.cs        # 主要資料模型
-│   ├── DockerModels.cs         # Docker 相關模型
-│   ├── TestInfo.cs             # 測試資訊模型
-│   └── ...
+│   ├── ApiEndpoint.cs          # API 端點（含參數、回應、request body）
+│   ├── ApiTrace.cs             # API 追蹤路徑（TraceStep、SqlQuery、SqlParameter）
+│   ├── ContainerInfo.cs        # 容器服務、Port 映射、Dockerfile 解析結果
+│   ├── DashboardData.cs        # 完整 Dashboard 資料聚合根（含 MetaInfo、SecurityRisk）
+│   ├── DependencyGraph.cs      # 依賴圖節點與邊（PackageDependency）
+│   ├── EnvVariable.cs          # 環境變數模型（含 IsSensitive 旗標）
+│   ├── FileNode.cs             # 檔案樹節點（IsDirectory / Children / Language）
+│   ├── MakefileInfo.cs         # Makefile 內容與 target 清單
+│   ├── ProjectInfo.cs          # 專案名稱、語言統計、Git 資訊（LanguageInfo）
+│   └── TestInfo.cs             # 測試套件摘要（TestSuiteInfo / TestFile / MockInfo）
 ├── Services/
-│   ├── AnalysisOrchestrator.cs # 分析流程協調
-│   └── CopilotSemanticAnalyzer.cs  # GitHub Copilot AI 分析
-└── Program.cs                  # CLI 入口點
+│   ├── AnalysisOrchestrator.cs # 三階段並行分析管線協調器
+│   └── DotEnvLoader.cs         # 啟動時從 .env 載入允許的環境變數（CWE-426 防護）
+└── Program.cs                  # CLI 入口點（System.CommandLine）
 ```
 
 ## 技術棧

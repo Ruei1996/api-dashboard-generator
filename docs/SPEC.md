@@ -184,14 +184,15 @@ Phase 1 — 串行初始化
   └─ 讀取 copilot-instructions.md（< 512 KB）
 
 Phase 2 — 並行分析（Task.WhenAll）
-  ├─ DependencyAnalyzer     → Packages, DependencyGraph
+  ├─ DependencyAnalyzer     → Packages
   ├─ DockerAnalyzer         → Containers, Dockerfile
   ├─ SwaggerAnalyzer        → ApiEndpoints
   ├─ EnvFileAnalyzer        → EnvVariables
-  └─ TestAnalyzer           → Tests
+  ├─ TestAnalyzer           → Tests
+  └─ MakefileAnalyzer       → Makefile
   │
-  ├─ MakefileAnalyzer       → Makefile        （串行，依賴 allFiles）
-  └─ ApiTraceAnalyzer       → ApiTraces        （串行，依賴 ApiEndpoints）
+  ├─ DependencyAnalyzer.BuildGraph() → DependencyGraph  （串行，依賴 Packages）
+  └─ ApiTraceAnalyzer       → ApiTraces                 （串行，依賴 ApiEndpoints）
 
 Phase 3 — 並行 AI 語義分析（Task.WhenAll）
   ├─ GenerateProjectSummaryAsync   → CopilotSummary
@@ -326,6 +327,10 @@ Phase 3 — 並行 AI 語義分析（Task.WhenAll）
 
 ## 8. JSON 元資料結構
 
+> 以下結構由 `JsonMetadataGenerator.Generate()` 輸出，只包含機器可讀的穩定欄位。
+> 完整的 `DashboardData` 資料（含 FileTree、DependencyGraph 等）僅存在於 HTML 內嵌的
+> `window.__RID_DATA__` JSON blob 中。
+
 ```json
 {
   "meta": {
@@ -333,68 +338,70 @@ Phase 3 — 並行 AI 語義分析（Task.WhenAll）
     "toolVersion": "1.0.0",
     "projectName": "string",
     "branch": "string",
-    "repoPath": "string",
-    "theme": "dark"
+    "repoPath": "string (basename only — full host path is omitted)"
   },
-  "project": {
-    "name": "string",
-    "branch": "string",
-    "totalFiles": 0,
-    "totalSizeBytes": 0,
-    "languages": [{ "name": "string", "fileCount": 0, "percentage": 0.0 }],
-    "copilotInstructions": "string | null"
-  },
-  "packages": [{ "name": "string", "version": "string", "type": "string", "ecosystem": "string" }],
-  "dependencyGraph": { "nodes": [], "edges": [] },
-  "apiEndpoints": [{
-    "method": "string",
-    "path": "string",
-    "summary": "string",
-    "operationId": "string",
-    "tag": "string",
-    "isDeprecated": false,
-    "parameters": [{ "name": "string", "location": "query|path|header|cookie", "type": "string", "required": true }],
-    "responses": [{ "statusCode": "string", "description": "string", "contentType": "string", "schemaJson": "string", "exampleJson": "string" }],
-    "requestBody": { "required": true, "contentType": "string", "schema": "string" }
-  }],
-  "apiTraces": [{
-    "method": "string",
-    "path": "string",
-    "handlerFile": "string",
-    "handlerFunction": "string",
-    "steps": [{ "order": 0, "layer": "Handler|Service|Repository|External", "file": "string", "function": "string", "startLine": 0, "endLine": 0, "calledFunctions": [] }],
-    "sqlQueries": [{ "name": "string", "operation": "SELECT|INSERT|UPDATE|DELETE", "rawSql": "string", "composedSql": "string", "sourceFile": "string", "parameters": [] }]
-  }],
-  "containers": [{ "name": "string", "image": "string", "ports": [], "envVars": [], "dependsOn": [] }],
-  "dockerfile": { "baseImage": "string", "exposedPorts": [], "envVars": [], "stages": [] },
-  "envVariables": [{ "key": "string", "value": "string", "masked": true, "source": "string" }],
-  "tests": {
-    "unitTests": [{ "filePath": "string", "package": "string", "testCases": [] }],
-    "integrationTests": [],
-    "acceptanceTests": [],
-    "mocks": [{ "name": "string", "filePath": "string", "interfaceMocked": "string", "methods": [] }],
-    "totalTestCount": 0
-  },
-  "makefile": {
-    "exists": true,
-    "filePath": "string",
-    "content": "string",
-    "targets": ["build", "test", "clean"]
-  },
-  "startupSequence": ["db", "redis", "api"],
+  "languages": [
+    { "name": "string", "fileCount": 0, "percentage": 0.0, "color": "#hex" }
+  ],
+  "dependencies": [
+    { "name": "string", "version": "string", "type": "production|dev|peer", "ecosystem": "npm|nuget|go|maven|pip|cargo|…", "sourceFile": "string" }
+  ],
+  "apiEndpoints": [
+    {
+      "method": "GET|POST|PUT|DELETE|PATCH|QUERY|MUTATION|SUBSCRIPTION|RPC|STREAM",
+      "path": "string",
+      "summary": "string",
+      "description": "string",
+      "tag": "string",
+      "operationId": "string",
+      "isDeprecated": false,
+      "parameters": [
+        { "name": "string", "location": "query|path|header|cookie", "type": "string", "required": true, "description": "string" }
+      ],
+      "responses": [
+        { "statusCode": "string", "description": "string" }
+      ]
+    }
+  ],
+  "apiTraces": [
+    {
+      "method": "string",
+      "path": "string",
+      "handlerFile": "string",
+      "handlerFunction": "string",
+      "steps": [
+        { "order": 0, "layer": "Handler|Service|Repository|External", "file": "string", "function": "string", "description": "string", "startLine": 0, "endLine": 0, "calledFunctions": [] }
+      ],
+      "sqlQueries": [
+        { "name": "string", "operation": "SELECT|INSERT|UPDATE|DELETE", "rawSql": "string", "composedSql": "string", "sourceFile": "string", "functionName": "string", "parameters": [{ "name": "string", "type": "string", "placeholder": "string" }] }
+      ]
+    }
+  ],
+  "containers": [
+    {
+      "name": "string",
+      "image": "string",
+      "buildContext": "string",
+      "ports": [{ "hostPort": 0, "containerPort": 0, "protocol": "tcp|udp|grpc" }],
+      "envVars": [{ "key": "string", "value": "string", "masked": true }],
+      "dependsOn": ["string"]
+    }
+  ],
+  "envVariables": [
+    { "key": "string", "value": "string", "masked": true, "sourceFile": "string" }
+  ],
   "copilotSummary": "string",
   "designPatterns": ["微服務架構", "RESTful API"],
-  "securityRisks": [{
-    "level": "critical|high|warning|info",
-    "priority": 1,
-    "category": "A1-注入攻擊",
-    "title": "string",
-    "description": "string",
-    "recommendation": "string",
-    "filePath": "string | null",
-    "lineNumber": 0,
-    "affectedFiles": []
-  }]
+  "securityRisks": [
+    { "level": "critical|high|warning|info", "title": "string", "description": "string", "filePath": "string | null" }
+  ],
+  "startupSequence": ["db", "redis", "api"],
+  "dockerfile": {
+    "baseImage": "string",
+    "exposedPorts": [0],
+    "stages": ["string"],
+    "workDir": "string"
+  }
 }
 ```
 

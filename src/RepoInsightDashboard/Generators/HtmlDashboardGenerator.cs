@@ -107,10 +107,24 @@ public class HtmlDashboardGenerator
         // across calls, avoiding repeated reflection over all serialized model types.
 
         // Serialize a sanitized projection so the JS global never contains raw secrets.
+        // Build a safeMeta with the full host filesystem path stripped to basename only,
+        // consistent with JsonMetadataGenerator. CWE-200: a shared HTML report must not
+        // reveal the absolute path layout of the developer's machine.
+        var safeMeta = new
+        {
+            data.Meta.GeneratedAt,
+            data.Meta.ToolVersion,
+            data.Meta.ProjectName,
+            data.Meta.Branch,
+            RepoPath = Path.GetFileName(data.Meta.RepoPath.TrimEnd(Path.DirectorySeparatorChar,
+                                                                     Path.AltDirectorySeparatorChar)),
+            data.Meta.Theme
+        };
+
         var safeData = new
         {
             data.Project,
-            data.Meta,
+            Meta            = safeMeta,
             data.FileTree,
             data.ApiEndpoints,
             data.ApiTraces,
@@ -135,9 +149,10 @@ public class HtmlDashboardGenerator
         sb.AppendLine($"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
         // Content-Security-Policy: block all external resource loading from the generated file.
         // 'unsafe-inline' is required because all scripts and styles are inlined (no nonces).
-        // form-action 'none' blocks any form POST exfiltration; base-uri 'none' prevents <base> injection;
-        // frame-ancestors 'none' prevents clickjacking if the file is ever served over HTTP.
-        sb.AppendLine("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none';\">");
+        // form-action 'none' blocks any form POST exfiltration; base-uri 'none' prevents <base> injection.
+        // NOTE: frame-ancestors is intentionally omitted — it is only enforceable via an HTTP response
+        // header, NOT a <meta> tag; browsers ignore it in meta and log a console warning (HTML5 spec §4.12.5.1).
+        sb.AppendLine("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; base-uri 'none';\">");
         sb.AppendLine("<meta name=\"referrer\" content=\"no-referrer\">");
         sb.AppendLine($"<title>{HtmlEncode(data.Project.Name)} — Repo Insight Dashboard</title>");
         sb.AppendLine(GetInlineStyles());
@@ -272,24 +287,34 @@ public class HtmlDashboardGenerator
     /// (file tree, tests, Makefile) start collapsed to reduce initial page scroll height.
     /// </param>
     /// <returns>HTML fragment for the full collapsible section element.</returns>
-    private string BuildSection(string id, string title, string icon, string content, bool collapsed = false) => $"""
-        <section class="section {(collapsed ? "collapsed" : "")}" id="section-{id}" aria-labelledby="heading-{id}">
-          <div class="section-header" onclick="toggleSection('{id}')" role="button" tabindex="0"
-               onkeydown="if(event.key==='Enter'||event.key===' ')toggleSection('{id}')">
-            <h2 class="section-title" id="heading-{id}">
-              <span class="section-icon">{icon}</span>
-              {title}
-            </h2>
-            <button class="collapse-btn" aria-expanded="{(!collapsed).ToString().ToLower()}"
-                    aria-controls="body-{id}" title="摺疊/展開">
-              <span class="collapse-icon">{(collapsed ? "▶" : "▼")}</span>
-            </button>
-          </div>
-          <div class="section-body" id="body-{id}" role="region">
-            {content}
-          </div>
-        </section>
-        """;
+    private string BuildSection(string id, string title, string icon, string content, bool collapsed = false)
+    {
+        // HTML-encode all caller-supplied strings before interpolation.
+        // While all current callers pass hardcoded literals, encoding here provides
+        // defence-in-depth: a future caller passing data.Project.Name (user-controlled)
+        // cannot inject into the section heading or id attributes. (CWE-79 / OWASP A03)
+        var safeId    = HtmlEncode(id);
+        var safeTitle = HtmlEncode(title);
+        var safeIcon  = HtmlEncode(icon);
+        return $"""
+            <section class="section {(collapsed ? "collapsed" : "")}" id="section-{safeId}" aria-labelledby="heading-{safeId}">
+              <div class="section-header" onclick="toggleSection('{safeId}')" role="button" tabindex="0"
+                   onkeydown="if(event.key==='Enter'||event.key===' ')toggleSection('{safeId}')">
+                <h2 class="section-title" id="heading-{safeId}">
+                  <span class="section-icon">{safeIcon}</span>
+                  {safeTitle}
+                </h2>
+                <button class="collapse-btn" aria-expanded="{(!collapsed).ToString().ToLower()}"
+                        aria-controls="body-{safeId}" title="摺疊/展開">
+                  <span class="collapse-icon">{(collapsed ? "▶" : "▼")}</span>
+                </button>
+              </div>
+              <div class="section-body" id="body-{safeId}" role="region">
+                {content}
+              </div>
+            </section>
+            """;
+    }
 
     private string BuildOverviewSection(DashboardData data)
     {
@@ -645,7 +670,9 @@ public class HtmlDashboardGenerator
         var ganttRows = string.Join("\n", visibleSequence.Select((svc, i) =>
         {
             var duration = 3 + (svc.Length % 5);
-            var start = visibleSequence.Take(i).Sum(s => 3 + (s.Length % 5) / 2);
+            // Use floating-point division to get accurate fractional offsets.
+            // Without it, (s.Length % 5) / 2 truncates 3/2 → 1 instead of 1.5.
+            var start = visibleSequence.Take(i).Sum(s => 3 + (s.Length % 5) / 2.0);
             var pctLeft = Math.Min(start * 5, 80);
             var pctWidth = Math.Max(duration * 5, 10);
             var colors = new[] { "#58a6ff", "#3fb950", "#d29922", "#bc8cff", "#f85149" };
@@ -717,10 +744,12 @@ public class HtmlDashboardGenerator
 
     private string BuildFileTreeSection(DashboardData data)
     {
-        var treeHtml = BuildFileTreeHtml(data.FileTree, 0);
+        // Use a single shared StringBuilder to avoid per-node string allocations (P2-A perf fix).
+        var treeSb = new StringBuilder();
+        AppendFileTreeHtml(treeSb, data.FileTree, 0);
         var content = $"""
             <div class="file-tree" id="file-tree-root">
-              {treeHtml}
+              {treeSb}
             </div>
             <p class="text-secondary" style="font-size:12px;margin-top:8px">
               共 {data.Project.TotalFiles} 個檔案，總大小 {FormatBytes(data.Project.TotalSizeBytes)}
@@ -730,14 +759,19 @@ public class HtmlDashboardGenerator
         return BuildSection("filetree", "檔案樹", "🗂️", content, true);
     }
 
-    private string BuildFileTreeHtml(FileNode node, int depth)
+    /// <summary>
+    /// Appends the HTML representation of a file-tree node (and all children up to
+    /// <c>MAX_FILETREE_DEPTH</c>) into the supplied <paramref name="sb"/>.
+    /// Accepts a shared StringBuilder top-down so the recursion never allocates
+    /// intermediate strings — O(N) total allocations instead of O(N × depth).
+    /// </summary>
+    private const int MAX_FILETREE_DEPTH = 5;
+    private static void AppendFileTreeHtml(StringBuilder sb, FileNode node, int depth)
     {
-        var sb = new StringBuilder();
-        if (depth > 5) return ""; // Limit depth
+        if (depth > MAX_FILETREE_DEPTH) return;
 
         if (node.IsDirectory)
         {
-            var hasChildren = node.Children.Count > 0;
             var collapseId = $"ft_{depth}_{SanitizeMermaidId(node.Name)}_{node.GetHashCode():X4}";
             sb.AppendLine($"""
                 <div class="ft-dir" data-depth="{depth}">
@@ -749,7 +783,7 @@ public class HtmlDashboardGenerator
                   <div class="ft-children" id="{collapseId}">
                 """);
             foreach (var child in node.Children.Take(50))
-                sb.Append(BuildFileTreeHtml(child, depth + 1));
+                AppendFileTreeHtml(sb, child, depth + 1);
             if (node.Children.Count > 50)
                 sb.AppendLine($"<div class=\"ft-more text-secondary\">... 還有 {node.Children.Count - 50} 個項目</div>");
             sb.AppendLine("</div></div>");
@@ -767,7 +801,6 @@ public class HtmlDashboardGenerator
                 </div>
                 """);
         }
-        return sb.ToString();
     }
 
     private string BuildSecuritySection(DashboardData data)
@@ -776,10 +809,18 @@ public class HtmlDashboardGenerator
             return BuildSection("security", "安全分析", "🛡️",
                 "<div class=\"info-box success\">✅ 靜態掃描未偵測到明顯安全問題。建議搭配 AI 分析（設定 GITHUB_COPILOT_TOKEN）進行深層審查。</div>");
 
-        var critical = data.SecurityRisks.Count(r => r.Priority == 1);
-        var high     = data.SecurityRisks.Count(r => r.Priority == 2);
-        var medium   = data.SecurityRisks.Count(r => r.Priority == 3);
-        var info     = data.SecurityRisks.Count(r => r.Priority == 4);
+        // Single pass over SecurityRisks to tally all four priority buckets (O(N) vs O(4N)).
+        int critical = 0, high = 0, medium = 0, info = 0;
+        foreach (var r in data.SecurityRisks)
+        {
+            switch (r.Priority)
+            {
+                case 1: critical++; break;
+                case 2: high++;     break;
+                case 3: medium++;   break;
+                default: info++;    break;
+            }
+        }
 
         var summaryBar = $"""
             <div class="sec-summary">
@@ -972,7 +1013,7 @@ public class HtmlDashboardGenerator
               <span style="color:#8b949e;font-size:12px">{mf.Targets.Count} 個指令</span>
             </div>
             {targetsHtml}
-            <pre class="dt-sql-code" style="max-height:600px;overflow-y:auto;tab-size:4">{HtmlEncode(mf.Content)}</pre>
+            <pre class="makefile-code" style="max-height:600px;overflow-y:auto;tab-size:4">{HtmlEncode(mf.Content)}</pre>
             """;
         return BuildSection("makefile", "Makefile 指令區", "⚙️", content, true);
     }
@@ -1019,12 +1060,16 @@ public class HtmlDashboardGenerator
     private static string EscapeMermaid(string? text)
         => (text ?? "").Replace("\"", "'").Replace("[", "(").Replace("]", ")").Replace("\n", " ");
 
+    // Compiled regex for SanitizeMermaidId — hoisted to avoid re-compilation on every node (P2-C perf fix).
+    private static readonly System.Text.RegularExpressions.Regex RxSanitizeId =
+        new(@"[^a-zA-Z0-9_]", System.Text.RegularExpressions.RegexOptions.Compiled);
+
     /// <summary>
     /// Sanitises a string for use as an HTML <c>id</c> attribute or Mermaid node identifier
     /// by replacing any character outside <c>[a-zA-Z0-9_]</c> with an underscore.
     /// </summary>
     private static string SanitizeMermaidId(string id)
-        => System.Text.RegularExpressions.Regex.Replace(id, @"[^a-zA-Z0-9_]", "_");
+        => RxSanitizeId.Replace(id, "_");
 
     /// <summary>
     /// Formats a raw byte count as a human-readable string with an appropriate unit suffix.
@@ -1366,6 +1411,14 @@ public class HtmlDashboardGenerator
         .ft-more { padding: 2px 4px; font-size: 11px; font-style: italic; }
         .ft-children { overflow: hidden; transition: max-height 0.2s ease; }
         .ft-children.collapsed { display: none; }
+        /* ═══ Makefile Code Block ═══ */
+        /* Scoped to the main dashboard page — distinct from the popup's .dt-sql-code class */
+        .makefile-code {
+          padding: 16px; font-family: var(--font-mono); font-size: 12px;
+          line-height: 1.7; overflow-x: auto; color: var(--text-primary);
+          white-space: pre; background: var(--bg-card);
+          border: 1px solid var(--border-color); border-radius: var(--radius);
+        }
         /* ═══ Test Sections ═══ */
         .test-file-card { background:var(--bg-card); border:1px solid var(--border-color); border-radius:var(--radius); margin-bottom:8px; overflow:hidden; }
         .test-file-header { display:flex; align-items:center; gap:8px; padding:10px 14px; cursor:pointer; background:var(--bg-hover); }
@@ -1899,7 +1952,7 @@ public class HtmlDashboardGenerator
             var rawName   = bm[2];
             // Strip trailing _validate suffix for a cleaner display label
             var dispName  = rawName.replace(/_validate$/, '');
-            conds.push({ defaultOn: bm[1].toUpperCase() === 'TRUE', name: rawName, dispName: dispName, cond: condStr, full: fullBlock, vn: vpm ? vpm[1] : null });
+            conds.push({ defaultOn: bm[1].toUpperCase() === 'TRUE', name: rawName, dispName: dispName, cond: condStr, full: fullBlock, vn: vpm ? vpm[1] : null, from: blockStart, to: j });
             // Advance the regex past the consumed block to avoid re-matching nested content
             blockRx.lastIndex = j;
           }
@@ -1918,22 +1971,26 @@ public class HtmlDashboardGenerator
           var hasOff = /\bOFFSET\s+\$1\b/i.test(sql);
           var hasLim = /\bLIMIT\s+\$2\b/i.test(sql);
 
-          // ── 4. Build the initial clean SQL: default-off conditions are removed ─
-          var initSql = sql;
+          // ── 4. Build the initial clean SQL: use stored offsets (right-to-left) ─
+          // Applying replacements right-to-left keeps earlier offsets stable, identical
+          // to the updateSqlPreview logic — prevents split/join vs indexOf inconsistency.
+          var initReps = [];
           conds.forEach(function(c) {
-            initSql = c.defaultOn
-              ? initSql.split(c.full).join('AND ' + c.cond)
-              : initSql.split(c.full).join('');
+            initReps.push({ from: c.from, to: c.to, text: c.defaultOn ? 'AND ' + c.cond : '' });
           });
+          initReps.sort(function(a, b) { return b.from - a.from; });
+          var initSql = sql;
+          initReps.forEach(function(r) { initSql = initSql.slice(0, r.from) + r.text + initSql.slice(r.to); });
           if (hasOff) initSql = initSql.replace(/\bOFFSET\s+\$1\b/i, 'OFFSET 0');
           if (hasLim) initSql = initSql.replace(/\bLIMIT\s+\$2\b/i,  'LIMIT 10');
           initSql = initSql.replace(/[ \t]*\n([ \t]*\n){2,}/g, '\n\n').trim();
 
           // ── 5. Embed parsed data so the popup's updateSqlPreview can access it ─
-          // Unicode-escape < > & to prevent </script> in JSON from breaking the tag.
+          // JSON.stringify then unicode-escape < > & so the payload cannot produce
+          // a closing-tag sequence that would terminate the outer script block.
           var dataJson = JSON.stringify({ sql: sql, conds: conds, ils: inlines })
             .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
-          var h = '<script>if(!window._sqlBd)window._sqlBd={};window._sqlBd[' + idx + ']=' + dataJson + ';<\/script>';
+          var h = '<scr' + 'ipt>if(!window._sqlBd)window._sqlBd={};window._sqlBd[' + idx + ']=' + dataJson + ';<\/scr' + 'ipt>';
 
           // ── 6. Build the interactive widget HTML ─────────────────────────────
           h += '<div class="dt-sqlb">';
@@ -2003,7 +2060,7 @@ public class HtmlDashboardGenerator
           function layerColor(layer) { return LAYER_COLORS[layer] || '#8b949e'; }
 
           var ep = typeof endpoint === 'string' ? JSON.parse(endpoint) : endpoint;
-          var trace = (allData && allData.apiTraces || []).find(function(t) {
+          var trace = (allData?.apiTraces || []).find(function(t) {
             return t.method === ep.method && t.path === ep.path;
           });
 
@@ -2022,8 +2079,8 @@ public class HtmlDashboardGenerator
           if (ep.responses && ep.responses.length) {
             responsesHtml = '<div class="dt-resp-list">';
             ep.responses.forEach(function(r) {
-              var is2xx = r.statusCode && r.statusCode.toString().startsWith('2');
-              var is4xx = r.statusCode && r.statusCode.toString().startsWith('4');
+              var is2xx = r.statusCode && r.statusCode.startsWith('2');
+              var is4xx = r.statusCode && r.statusCode.startsWith('4');
               var badgeCls = is2xx ? 'dt-badge-green' : is4xx ? 'dt-badge-red' : 'dt-badge-yellow';
               responsesHtml += '<div class="dt-resp-card">';
               responsesHtml += '<div class="dt-resp-header">';
@@ -2158,7 +2215,9 @@ public class HtmlDashboardGenerator
             sqlHtml += '</div>';
           }
 
-          var html = '<!DOCTYPE html><html lang="zh-TW" data-theme="dark"><head><meta charset="UTF-8"><title>'+escHtml(ep.method)+' '+escHtml(ep.path)+'</title>'
+          var html = '<!DOCTYPE html><html lang="zh-TW" data-theme="dark"><head><meta charset="UTF-8">'
+            + '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; style-src \'unsafe-inline\'; form-action \'none\'; base-uri \'none\';">'
+            + '<title>'+escHtml(ep.method)+' '+escHtml(ep.path)+'</title>'
             + '<style>'+getDtStyles()+'</style></head><body>'
             + '<div class="dt-navbar"><span class="dt-back" onclick="window.close()">✕ 關閉</span>'
             + '<span class="dt-method" style="background:'+methodColor+'22;color:'+methodColor+';border:1px solid '+methodColor+'44">'+escHtml(ep.method)+'</span>'
@@ -2191,10 +2250,10 @@ public class HtmlDashboardGenerator
             + 'function updateSqlPreview(idx){'
             + 'var d=window._sqlBd[idx];if(!d)return;'
             + 'var original=d.sql;'
-            // Collect {from, to, text} for each condition, using position in *original*
+            // Use stored character offsets from parse time — handles duplicate blocks
+            // correctly (indexOf would only replace the first occurrence).
             + 'var reps=[];'
             + 'd.conds.forEach(function(c,ci){'
-            + 'var pos=original.indexOf(c.full);if(pos===-1)return;'
             + 'var cb=document.getElementById("sqlcb_"+idx+"_"+ci);'
             + 'var vi=document.getElementById("sqlvi_"+idx+"_"+ci);'
             + 'var checked=cb&&cb.checked;'
@@ -2202,7 +2261,7 @@ public class HtmlDashboardGenerator
             // Substitute value placeholder with user-entered text
             + 'if(checked&&c.vn&&vi&&vi.value.trim()){'
             + 'var v=vi.value.trim();cond=cond.split("\'"+c.vn+"_value\'").join("\'"+v+"\'");}'
-            + 'reps.push({from:pos,to:pos+c.full.length,text:checked?"AND "+cond:""});});'
+            + 'reps.push({from:c.from,to:c.to,text:checked?"AND "+cond:""});});'
             // Apply right-to-left so earlier positions remain stable under slice()
             + 'reps.sort(function(a,b){return b.from-a.from;});'
             + 'var sql=original;'
@@ -2249,7 +2308,8 @@ public class HtmlDashboardGenerator
           var blobUrl = URL.createObjectURL(blob);
           // noopener prevents the child window from accessing window.opener (tab-nabbing).
           // Blob URL has an opaque origin, but noopener eliminates the reference entirely.
-          var w = window.open(blobUrl, '_blank', 'noopener,noreferrer');
+          // With noopener, window.open() returns null in Firefox — do not use the return value.
+          window.open(blobUrl, '_blank', 'noopener,noreferrer');
           // Revoke the object URL after a short delay — addEventListener('load') is
           // unavailable on noopener windows because window.open returns null in that case.
           setTimeout(function(){ URL.revokeObjectURL(blobUrl); }, 5000);
@@ -2409,9 +2469,11 @@ public class HtmlDashboardGenerator
         }
 
         // ═══ Console Error Prevention ═══
+        // Narrow error handler: only surface graph-render failures at warn level.
+        // Avoid a broad window.onerror suppressor that would hide security-relevant exceptions.
         window.addEventListener('error', function(e) {
-          console.warn('[RID] 已捕獲錯誤：', e.message);
-          return true;
+          if (e.filename && e.filename.indexOf('RidGraph') !== -1)
+            console.warn('[RID] 圖形渲染錯誤：', e.message);
         });
 
         // ═══ Init ═══

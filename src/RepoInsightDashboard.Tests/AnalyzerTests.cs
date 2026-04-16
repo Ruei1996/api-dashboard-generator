@@ -18,14 +18,24 @@
 
 using System.IO;
 using RepoInsightDashboard.Analyzers;
+using RepoInsightDashboard.Commands;
 using RepoInsightDashboard.Generators;
 using RepoInsightDashboard.Models;
 using Xunit;
 
 namespace RepoInsightDashboard.Tests;
 
+/// <summary>
+/// Tests for <see cref="GitignoreParser"/>: verifies that default ignore patterns
+/// and project-specific .gitignore rules are applied correctly.
+/// </summary>
 public class GitignoreParserTests
 {
+    /// <summary>
+    /// Verifies that the built-in <c>DefaultIgnores</c> list correctly classifies
+    /// well-known paths (node_modules, bin, .git) as ignored and ordinary source
+    /// files as not ignored, without requiring any .gitignore file on disk.
+    /// </summary>
     [Theory]
     [InlineData("node_modules/foo.js", true)]
     [InlineData("src/main.cs", false)]
@@ -43,6 +53,11 @@ public class GitignoreParserTests
         finally { Directory.Delete(tmpDir, true); }
     }
 
+    /// <summary>
+    /// Verifies that custom patterns written to a .gitignore file on disk (e.g. "*.log",
+    /// "build/") are parsed and applied, and that files not matching any pattern are
+    /// treated as not ignored.
+    /// </summary>
     [Fact]
     public void CustomGitignoreRules_AreRespected()
     {
@@ -60,8 +75,16 @@ public class GitignoreParserTests
     }
 }
 
+/// <summary>
+/// Tests for <see cref="LanguageDetector"/>: verifies extension-to-language mapping
+/// and percentage computation across a mixed-language file set.
+/// </summary>
 public class LanguageDetectorTests
 {
+    /// <summary>
+    /// Confirms that <see cref="LanguageDetector.GetLanguage"/> returns the expected
+    /// display name for known extensions and <c>null</c> for unrecognised ones.
+    /// </summary>
     [Theory]
     [InlineData(".cs", "C#")]
     [InlineData(".go", "Go")]
@@ -73,6 +96,11 @@ public class LanguageDetectorTests
         Assert.Equal(expected, LanguageDetector.GetLanguage(ext));
     }
 
+    /// <summary>
+    /// Verifies that <see cref="LanguageDetector.Detect"/> groups files by language,
+    /// sorts the result by file count (descending), and calculates percentages correctly
+    /// (C# with 2 of 3 files should have percentage > 50 %).
+    /// </summary>
     [Fact]
     public void Detect_ComputesPercentages()
     {
@@ -90,10 +118,19 @@ public class LanguageDetectorTests
     }
 }
 
+/// <summary>
+/// Tests for <see cref="DependencyAnalyzer"/>: verifies that npm <c>package.json</c> and
+/// .NET <c>*.csproj</c> manifests are correctly parsed into <see cref="PackageDependency"/> lists.
+/// </summary>
 public class DependencyAnalyzerTests
 {
     private readonly DependencyAnalyzer _analyzer = new();
 
+    /// <summary>
+    /// Verifies that <c>dependencies</c>, <c>devDependencies</c> sections from a
+    /// <c>package.json</c> file are parsed into a flat list with correct names,
+    /// versions, and type labels ("production" vs "dev").
+    /// </summary>
     [Fact]
     public void ParsePackageJson_ExtractsDependencies()
     {
@@ -124,6 +161,10 @@ public class DependencyAnalyzerTests
         finally { File.Delete(tmpFile); }
     }
 
+    /// <summary>
+    /// Verifies that <c>PackageReference</c> items in a <c>.csproj</c> file are parsed
+    /// with correct names, versions, and the "nuget" ecosystem label.
+    /// </summary>
     [Fact]
     public void ParseCsproj_ExtractsPackageReferences()
     {
@@ -155,8 +196,18 @@ public class DependencyAnalyzerTests
     }
 }
 
+/// <summary>
+/// Tests for <see cref="EnvFileAnalyzer"/>: verifies that key-value pairs are correctly
+/// extracted and that values whose keys match sensitive patterns are masked.
+/// </summary>
 public class EnvFileAnalyzerTests
 {
+    /// <summary>
+    /// Verifies that three variables are extracted from a minimal .env file,
+    /// that <c>DB_HOST</c> (non-sensitive) is returned with its literal value,
+    /// and that <c>DB_PASSWORD</c> (sensitive keyword) has <see cref="EnvVariable.IsSensitive"/>
+    /// set to <c>true</c> and its value replaced with <c>"***masked***"</c>.
+    /// </summary>
     [Fact]
     public void Analyze_ExtractsEnvVariables()
     {
@@ -188,8 +239,17 @@ public class EnvFileAnalyzerTests
     }
 }
 
+/// <summary>
+/// Tests for <see cref="HtmlDashboardGenerator"/>: validates HTML output structure
+/// and the private <c>SanitizeFileName</c> helper via reflection.
+/// </summary>
 public class HtmlDashboardGeneratorTests
 {
+    /// <summary>
+    /// Verifies that <see cref="HtmlDashboardGenerator.Generate"/> produces a valid HTML document
+    /// containing all required section IDs, key UI elements (search bar, theme-toggle, RidGraph),
+    /// and that the output is bookended by <c>&lt;!DOCTYPE html&gt;</c> and <c>&lt;/html&gt;</c>.
+    /// </summary>
     [Fact]
     public void Generate_ProducesValidHtmlWithAllSections()
     {
@@ -199,7 +259,7 @@ public class HtmlDashboardGeneratorTests
             {
                 ProjectName = "TestProject",
                 Branch = "main",
-                RepoPath = "/tmp/test",
+                RepoPath = Path.Combine(Path.GetTempPath(), "test"),
                 ToolVersion = "1.0.0"
             },
             Project = new ProjectInfo
@@ -230,19 +290,42 @@ public class HtmlDashboardGeneratorTests
         Assert.EndsWith("</html>" + Environment.NewLine, html);
     }
 
-    [Fact]
-    public void Generate_NamingConvention_IsCorrect()
+    /// <summary>
+    /// Verifies that <c>AnalyzeCommand.SanitizeFileName</c> (accessed via reflection because it is
+    /// <c>private static</c>) replaces illegal filesystem characters with underscores and formats the
+    /// output filename correctly for a range of name/branch combinations.
+    /// </summary>
+    [Theory]
+    [InlineData("MyApp",       "main",           "MyApp-dashboard-(main).html")]
+    [InlineData("my:app",      "feature/test",   "my_app-dashboard-(feature_test).html")]
+    [InlineData("my-app",      "release/1.0",    "my-app-dashboard-(release_1.0).html")]
+    public void SanitizeFileName_ProducesCorrectOutputFileName(
+        string name, string branch, string expectedFileName)
     {
-        // Verify the output file naming logic
-        var name = "MyApp";
-        var branch = "feature/test";
-        var expected = $"{name}-dashboard-({branch}).html";
-        Assert.Equal("MyApp-dashboard-(feature/test).html", expected);
+        // Access SanitizeFileName via reflection — it is private static in AnalyzeCommand.
+        var method = typeof(AnalyzeCommand).GetMethod(
+            "SanitizeFileName",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+        var safeName   = (string)method.Invoke(null, [name])!;
+        var safeBranch = (string)method.Invoke(null, [branch])!;
+        var actual = $"{safeName}-dashboard-({safeBranch}).html";
+        Assert.Equal(expectedFileName, actual);
     }
 }
 
+/// <summary>
+/// Tests for <see cref="JsonMetadataGenerator"/>: verifies that the generated JSON
+/// contains the expected top-level keys and representative data values.
+/// </summary>
 public class JsonMetadataGeneratorTests
 {
+    /// <summary>
+    /// Verifies that <see cref="JsonMetadataGenerator.Generate"/> produces a valid,
+    /// non-empty JSON string containing the required top-level keys (<c>meta</c>,
+    /// <c>languages</c>, <c>dependencies</c>, <c>apiEndpoints</c>) and representative
+    /// values from the supplied <see cref="DashboardData"/>.
+    /// </summary>
     [Fact]
     public void Generate_ProducesValidJsonStructure()
     {

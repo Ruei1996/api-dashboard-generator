@@ -40,11 +40,28 @@ public class EnvFileAnalyzer
     // Uses OrdinalIgnoreCase so "Password", "PASSWORD", and "password" all match.
     // Intentionally broad — false positives (masking a non-secret) are far safer
     // than false negatives (displaying a real credential in the dashboard).
+    // ── 2025-05 expansion: added connection-string key patterns (CWE-312 / OWASP A02) ──
+    // Keys like DATABASE_URL, REDIS_URL, MONGO_URI, DSN, and CONNECTION_STRING embed
+    // user:password pairs in the VALUE even though the KEY name sounds benign.
     private static readonly HashSet<string> SensitiveKeywords = new(StringComparer.OrdinalIgnoreCase)
     {
         "password", "passwd", "secret", "key", "token", "credential",
-        "api_key", "apikey", "private", "auth", "cert", "pass"
+        "api_key", "apikey", "private", "auth", "cert", "pass",
+        // Connection-string patterns — key name doesn't contain "password" but value does
+        "url",        // DATABASE_URL, REDIS_URL, MONGO_URL
+        "uri",        // MONGO_URI, DATABASE_URI
+        "dsn",        // DSN, DATABASE_DSN
+        "connection", // CONNECTION_STRING, DB_CONNECTION
+        "connstr",    // CONNSTR, CONN_STR
+        "jdbc"        // JDBC_URL (Java services)
     };
+
+    // Second gate: value-level detection for "scheme://user:password@host" patterns.
+    // Catches credentials embedded in connection strings whose key name is neutral
+    // (e.g. DATABASE_URL=postgres://app:S3cr3t@db:5432/prod). CWE-312.
+    private static readonly System.Text.RegularExpressions.Regex _urlCredentialPattern =
+        new(@"://[^:@/\s]+:[^:@/\s]{4,}@",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// Parses all .env files present in <paramref name="files"/>, skipping test fixtures,
@@ -81,11 +98,12 @@ public class EnvFileAnalyzer
                     var key = trimmed[..eqIdx].Trim();
                     var rawValue = trimmed[(eqIdx + 1)..].Trim().Trim('"', '\'');
 
-                    // Check whether ANY sensitive keyword appears anywhere in the key name.
-                    // Using Contains (substring match) rather than Equals so composite keys
-                    // like "DB_PASSWORD" or "STRIPE_API_KEY" are also caught.
+                    // Two-gate sensitive check (OWASP A02 / CWE-312):
+                    // Gate 1 — key-name substring match (catches DB_PASSWORD, STRIPE_API_KEY …)
+                    // Gate 2 — value-level URL credential pattern (catches DATABASE_URL=postgres://user:pass@host)
                     var isSensitive = SensitiveKeywords.Any(kw =>
-                        key.Contains(kw, StringComparison.OrdinalIgnoreCase));
+                        key.Contains(kw, StringComparison.OrdinalIgnoreCase))
+                        || _urlCredentialPattern.IsMatch(rawValue);
 
                     // Mask sensitive values at parse time — the earliest safe opportunity.
                     // Doing this here (rather than at the HTML/JSON output layer) ensures
