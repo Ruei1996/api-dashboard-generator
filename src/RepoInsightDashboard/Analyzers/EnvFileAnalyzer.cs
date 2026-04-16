@@ -102,7 +102,16 @@ public class EnvFileAnalyzer
                     });
                 }
             }
-            catch { /* skip unreadable files — non-fatal, continue with remaining env files */ }
+            catch (IOException ex)
+            {
+                // Unreadable env files are non-fatal (e.g. permissions issue); log to stderr
+                // so the problem is visible without aborting the full analysis. (CWE-390)
+                Console.Error.WriteLine($"[EnvFileAnalyzer] 無法讀取 {file.RelativePath}: {ex.Message}");
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                Console.Error.WriteLine($"[EnvFileAnalyzer] 存取被拒 {file.RelativePath}: {ex.Message}");
+            }
         }
         return vars;
     }

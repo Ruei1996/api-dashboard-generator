@@ -143,6 +143,8 @@ public class AnalysisOrchestrator
         var swaggerAnalyzer = new SwaggerAnalyzer();
         var envAnalyzer    = new EnvFileAnalyzer();
         var testAnalyzer   = new TestAnalyzer();
+        // MakefileAnalyzer has no cross-dependencies — include in the concurrent batch.
+        var makefileAnalyzer = new MakefileAnalyzer();
 
         var packagesTask    = Task.Run(() => depAnalyzer.Analyze(allFiles), ct);
         var containersTask  = Task.Run(() => dockerAnalyzer.Analyze(allFiles), ct);
@@ -150,8 +152,9 @@ public class AnalysisOrchestrator
         var swaggerTask     = Task.Run(() => swaggerAnalyzer.Analyze(allFiles), ct);
         var envTask         = Task.Run(() => envAnalyzer.Analyze(allFiles), ct);
         var testsTask       = Task.Run(() => testAnalyzer.Analyze(allFiles), ct);
+        var makefileTask    = Task.Run(() => makefileAnalyzer.Analyze(repoPath, allFiles), ct);
 
-        await Task.WhenAll(packagesTask, containersTask, dockerfileTask, swaggerTask, envTask, testsTask);
+        await Task.WhenAll(packagesTask, containersTask, dockerfileTask, swaggerTask, envTask, testsTask, makefileTask);
 
         data.Packages      = packagesTask.Result;
         data.DependencyGraph = depAnalyzer.BuildGraph(data.Packages, data.Project);
@@ -175,10 +178,7 @@ public class AnalysisOrchestrator
         data.Tests         = testsTask.Result;
         Log($"[RID] 測試：{data.Tests.TotalTestCount} 個");
 
-        // Makefile analysis runs after file scan (requires allFiles list)
-        Log("[RID] 分析 Makefile...");
-        var makefileAnalyzer = new MakefileAnalyzer();
-        data.Makefile = makefileAnalyzer.Analyze(repoPath, allFiles);
+        data.Makefile = makefileTask.Result;
         Log(data.Makefile.Exists
             ? $"[RID] 找到 Makefile：{data.Makefile.Targets.Count} 個指令"
             : $"[RID] 未找到 Makefile，已自動生成 {data.Makefile.Targets.Count} 個指令");
@@ -259,11 +259,14 @@ public class AnalysisOrchestrator
         var visited = new HashSet<string>();
         var order = new List<string>();
 
+        // O(C) dictionary lookup replaces O(C²) FirstOrDefault scan inside DFS recursion.
+        var byName = data.Containers.ToDictionary(c => c.Name, c => c);
+
         void Visit(string name)
         {
             if (!visited.Add(name)) return;
-            var c = data.Containers.FirstOrDefault(x => x.Name == name);
-            if (c != null) foreach (var dep in c.DependsOn) Visit(dep);
+            if (byName.TryGetValue(name, out var c))
+                foreach (var dep in c.DependsOn) Visit(dep);
             order.Add(name);
         }
         foreach (var c in data.Containers) Visit(c.Name);

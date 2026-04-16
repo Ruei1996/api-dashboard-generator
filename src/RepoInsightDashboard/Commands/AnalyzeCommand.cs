@@ -19,7 +19,7 @@ public static class AnalyzeCommand
 
         var tokenOpt = new Option<string?>(
             aliases: ["--copilot-token"],
-            description: "GitHub Copilot API Token（可選，啟用 AI 語義分析）");
+            description: "[DEPRECATED] 請改用 GITHUB_COPILOT_TOKEN 環境變數 — CLI 旗標會出現在 ps aux 和 shell history 中（CWE-214）");
 
         var themeOpt = new Option<string>(
             aliases: ["--theme"],
@@ -42,6 +42,15 @@ public static class AnalyzeCommand
 
         cmd.SetHandler(async (repoDir, outputDir, token, theme, noAi, verbose) =>
         {
+            // Deprecation warning: --copilot-token exposes the token in process tables and
+            // shell history. Advise users to switch to the env var instead.
+            if (!string.IsNullOrEmpty(token))
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Error.WriteLine("[警告] --copilot-token 已棄用：token 會出現在 ps aux 和 shell history 中。");
+                Console.Error.WriteLine("       請改用 GITHUB_COPILOT_TOKEN 環境變數或 ~/.config/rid/.env。");
+                Console.ResetColor();
+            }
             await RunAsync(repoDir, outputDir, noAi ? null : token, theme, verbose);
         }, pathArg, outputOpt, tokenOpt, themeOpt, noAiOpt, verboseOpt);
 

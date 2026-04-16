@@ -222,23 +222,34 @@ public class DockerAnalyzer
                         {
                             var parts = e?.ToString()?.Split('=', 2) ?? [];
                             if (parts.Length >= 1)
+                            {
+                                var isSensitive = _sensitiveEnvKeywords.Any(kw =>
+                                    parts[0].Contains(kw, StringComparison.OrdinalIgnoreCase));
                                 container.EnvVariables.Add(new EnvVariable
                                 {
                                     Key = parts[0],
-                                    Value = parts.Length > 1 ? parts[1] : "",
+                                    Value = isSensitive ? "***masked***" : (parts.Length > 1 ? parts[1] : ""),
+                                    IsSensitive = isSensitive,
                                     SourceFile = file.RelativePath
                                 });
+                            }
                         }
                     }
                     else if (envObj is Dictionary<object, object> envDict)
                     {
                         foreach (var (k, v) in envDict)
+                        {
+                            var key = k.ToString()!;
+                            var isSensitive = _sensitiveEnvKeywords.Any(kw =>
+                                key.Contains(kw, StringComparison.OrdinalIgnoreCase));
                             container.EnvVariables.Add(new EnvVariable
                             {
-                                Key = k.ToString()!,
-                                Value = v?.ToString() ?? "",
+                                Key = key,
+                                Value = isSensitive ? "***masked***" : (v?.ToString() ?? ""),
+                                IsSensitive = isSensitive,
                                 SourceFile = file.RelativePath
                             });
+                        }
                     }
                 }
 

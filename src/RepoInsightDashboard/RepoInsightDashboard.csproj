@@ -14,8 +14,6 @@
     <Description>Repo Insight Dashboard — 程式碼庫語義分析 CLI 工具</Description>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <Optimize>true</Optimize>
-    <!-- Suppress nullable warnings for generated content -->
-    <NoWarn>$(NoWarn);CS8600;CS8602;CS8603</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

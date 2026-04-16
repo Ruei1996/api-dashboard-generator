@@ -58,6 +58,16 @@ public class HtmlDashboardGenerator
         // contain '<', '>', '&' which must be unicode-escaped inside HTML onclick attributes.
         StringEscapeHandling = StringEscapeHandling.EscapeHtml
     };
+
+    // Shared serialization settings for window.__RID_DATA__ — static readonly so
+    // CamelCasePropertyNamesContractResolver's internal type-contract cache is preserved
+    // across all Generate() calls, eliminating repeated per-call type reflection.
+    private static readonly JsonSerializerSettings _dataJsonSettings = new()
+    {
+        ContractResolver     = new CamelCasePropertyNamesContractResolver(),
+        NullValueHandling    = NullValueHandling.Ignore,
+        StringEscapeHandling = StringEscapeHandling.EscapeHtml
+    };
     /// <summary>
     /// Renders <paramref name="data"/> into a complete, self-contained HTML string
     /// that can be written directly to a <c>.html</c> file.
@@ -93,12 +103,8 @@ public class HtmlDashboardGenerator
         // Use StringEscapeHandling.EscapeHtml so characters like </script> inside
         // the JSON payload are unicode-escaped and cannot break out of the <script> block.
         // CWE-79 / OWASP A03:2021 Injection.
-        var jsonSettings = new JsonSerializerSettings
-        {
-            ContractResolver   = new CamelCasePropertyNamesContractResolver(),
-            NullValueHandling  = NullValueHandling.Ignore,
-            StringEscapeHandling = StringEscapeHandling.EscapeHtml
-        };
+        // _dataJsonSettings is static readonly — reuses the internal type-contract cache
+        // across calls, avoiding repeated reflection over all serialized model types.
 
         // Serialize a sanitized projection so the JS global never contains raw secrets.
         var safeData = new
@@ -120,18 +126,21 @@ public class HtmlDashboardGenerator
             data.StartupSequence,
             data.Makefile
         };
-        var jsonData = JsonConvert.SerializeObject(safeData, Formatting.None, jsonSettings);
+        var jsonData = JsonConvert.SerializeObject(safeData, Formatting.None, _dataJsonSettings);
 
         sb.AppendLine("<!DOCTYPE html>");
-        sb.AppendLine("<html lang=\"zh-TW\" data-theme=\"dark\">");
+        sb.AppendLine($"<html lang=\"zh-TW\" data-theme=\"{HtmlEncode(data.Meta.Theme)}\">");
         sb.AppendLine("<head>");
         sb.AppendLine($"<meta charset=\"UTF-8\">");
         sb.AppendLine($"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
         // Content-Security-Policy: block all external resource loading from the generated file.
         // 'unsafe-inline' is required because all scripts and styles are inlined (no nonces).
-        sb.AppendLine("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:;\">");
+        // form-action 'none' blocks any form POST exfiltration; base-uri 'none' prevents <base> injection;
+        // frame-ancestors 'none' prevents clickjacking if the file is ever served over HTTP.
+        sb.AppendLine("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none';\">");
+        sb.AppendLine("<meta name=\"referrer\" content=\"no-referrer\">");
         sb.AppendLine($"<title>{HtmlEncode(data.Project.Name)} — Repo Insight Dashboard</title>");
-        sb.AppendLine(GetInlineStyles(data.Meta.Theme));
+        sb.AppendLine(GetInlineStyles());
         sb.AppendLine("</head>");
         sb.AppendLine("<body>");
         sb.AppendLine(BuildNavbar(data));
@@ -458,7 +467,8 @@ public class HtmlDashboardGenerator
 
         var rows = string.Join("\n", data.ApiEndpoints.Select(e => $"""
             <tr class="searchable api-row {(e.IsDeprecated ? "deprecated" : "")}"
-                data-text="{HtmlEncode(e.Method)} {HtmlEncode(e.Path)} {HtmlEncode(e.Summary)}"
+                data-text="{HtmlEncode(e.Path)} {HtmlEncode(e.Summary)}"
+                data-method="{HtmlEncode(e.Method)}"
                 data-tag="{HtmlEncode(e.Tag ?? "")}"
                 onclick="openApiDetailTab({JsonConvert.SerializeObject(e, _onclickJson).Replace("\"", "&quot;")}, window.__RID_DATA__)"
                 style="cursor:pointer">
@@ -568,7 +578,13 @@ public class HtmlDashboardGenerator
 
         if (data.Dockerfile != null)
         {
-            // also include Dockerfile exposed ports
+            // Include Dockerfile EXPOSE ports as pseudo-service "Dockerfile"
+            var dockerfilePorts = data.Dockerfile.ExposedPorts
+                .Select(p => new { Service = "Dockerfile", HostPort = p, ContainerPort = p, Protocol = "tcp" });
+            allPorts = allPorts
+                .Concat(dockerfilePorts)
+                .OrderBy(p => p.HostPort)
+                .ToList();
         }
 
         if (allPorts.Count == 0)
@@ -1022,7 +1038,7 @@ public class HtmlDashboardGenerator
         _ => $"{bytes / 1024.0 / 1024.0 / 1024.0:F1} GB"
     };
 
-    private string GetInlineStyles(string theme) => """
+    private string GetInlineStyles() => """
         <style>
         /* ═══ CSS Design Tokens ═══ */
         :root {
@@ -1811,7 +1827,7 @@ public class HtmlDashboardGenerator
             var text = (row.dataset.text || '').toLowerCase();
             var tag = row.dataset.tag || '';
             var matchQ = !q || text.includes(q);
-            var matchM = !methodFilter || text.startsWith(methodFilter.toLowerCase());
+            var matchM = !methodFilter || (row.dataset.method || '').toUpperCase() === methodFilter;
             var matchT = !tagFilter || tag === tagFilter;
             row.classList.toggle('search-hidden', !(matchQ && matchM && matchT));
           });
@@ -1844,8 +1860,148 @@ public class HtmlDashboardGenerator
           if (el) el.classList.toggle('collapsed');
         }
 
+        // ═══ SQL Interactive Builder ═══
+        /**
+         * Parses a composedSql string for conditional sqlc-style validate-flag patterns and
+         * returns an HTML string containing an interactive parameter-fill form.
+         * Users can toggle each WHERE condition on/off, enter concrete values, and instantly
+         * preview a clean, copy-pasteable SQL statement ready for direct DB execution.
+         *
+         * Detected patterns:
+         *   AND (TRUE|FALSE = 'paramName_value'[::bool] OR actualCondition)
+         *   OFFSET $1 / LIMIT $2  (positional pagination params)
+         *   Any remaining 'xxx_value' placeholder tokens
+         *
+         * @param {string} sql  The composedSql string from an SqlQuery object.
+         * @param {number} idx  Index of the query within sqlQueries (used for unique element IDs).
+         * @returns {string}    HTML string for the interactive SQL builder widget.
+         */
+        function buildSqlInteractorHtml(sql, idx) {
+          // ── 1. Parse AND (BOOL = 'name_value'::bool OR condition) blocks ──────
+          var conds = [];
+          var blockRx = /AND\s+\((TRUE|FALSE)\s*=\s*'(\w+?)_value'(?:::bool)?\s+OR\s+/gi;
+          var bm;
+          blockRx.lastIndex = 0;
+          while ((bm = blockRx.exec(sql)) !== null) {
+            var blockStart = bm.index;
+            var condStart  = bm.index + bm[0].length;
+            // Walk forward to find the matching closing parenthesis (handles nested parens)
+            var depth = 1, j = condStart;
+            while (j < sql.length && depth > 0) {
+              if (sql[j] === '(') depth++;
+              else if (sql[j] === ')') depth--;
+              j++;
+            }
+            var condStr   = sql.substring(condStart, j - 1).trim();
+            var fullBlock = sql.substring(blockStart, j);
+            // Extract the value-placeholder name from inside the condition (e.g. 'receipt_value')
+            var vpm       = condStr.match(/'(\w+?)_value'/);
+            var rawName   = bm[2];
+            // Strip trailing _validate suffix for a cleaner display label
+            var dispName  = rawName.replace(/_validate$/, '');
+            conds.push({ defaultOn: bm[1].toUpperCase() === 'TRUE', name: rawName, dispName: dispName, cond: condStr, full: fullBlock, vn: vpm ? vpm[1] : null });
+            // Advance the regex past the consumed block to avoid re-matching nested content
+            blockRx.lastIndex = j;
+          }
+
+          // ── 2. Collect inline 'xxx_value' placeholders not covered by conditions ──
+          var excludedNames = {};
+          conds.forEach(function(c) { excludedNames[c.name] = true; if (c.vn) excludedNames[c.vn] = true; });
+          var inlines = [], seenInlines = {};
+          var ilRx = /'(\w+?)_value'/gi, ilm;
+          while ((ilm = ilRx.exec(sql)) !== null) {
+            var iName = ilm[1];
+            if (!excludedNames[iName] && !seenInlines[iName]) { seenInlines[iName] = true; inlines.push({ n: iName }); }
+          }
+
+          // ── 3. Detect positional OFFSET $1 / LIMIT $2 pagination params ───────
+          var hasOff = /\bOFFSET\s+\$1\b/i.test(sql);
+          var hasLim = /\bLIMIT\s+\$2\b/i.test(sql);
+
+          // ── 4. Build the initial clean SQL: default-off conditions are removed ─
+          var initSql = sql;
+          conds.forEach(function(c) {
+            initSql = c.defaultOn
+              ? initSql.split(c.full).join('AND ' + c.cond)
+              : initSql.split(c.full).join('');
+          });
+          if (hasOff) initSql = initSql.replace(/\bOFFSET\s+\$1\b/i, 'OFFSET 0');
+          if (hasLim) initSql = initSql.replace(/\bLIMIT\s+\$2\b/i,  'LIMIT 10');
+          initSql = initSql.replace(/[ \t]*\n([ \t]*\n){2,}/g, '\n\n').trim();
+
+          // ── 5. Embed parsed data so the popup's updateSqlPreview can access it ─
+          // Unicode-escape < > & to prevent </script> in JSON from breaking the tag.
+          var dataJson = JSON.stringify({ sql: sql, conds: conds, ils: inlines })
+            .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
+          var h = '<script>if(!window._sqlBd)window._sqlBd={};window._sqlBd[' + idx + ']=' + dataJson + ';<\/script>';
+
+          // ── 6. Build the interactive widget HTML ─────────────────────────────
+          h += '<div class="dt-sqlb">';
+          h += '<div class="dt-sqlb-hdr">';
+          h += '<span class="dt-sqlb-hdr-title">🔧 互動式 SQL 參數填入器</span>';
+          h += '<span class="dt-sqlb-hdr-hint">勾選條件並填入參數值，即時產生可執行的乾淨 SQL</span>';
+          h += '</div>';
+
+          // Pagination inputs (only shown when SQL uses positional $1/$2 params)
+          if (hasOff || hasLim) {
+            h += '<div class="dt-sqlb-sec"><div class="dt-sqlb-sec-title">分頁設定</div><div class="dt-sqlb-row">';
+            if (hasOff) h += '<label class="dt-sqlb-label">OFFSET</label><input type="number" id="sqloff_'+idx+'" value="0" min="0" class="dt-sqlb-input dt-sqlb-num" oninput="updateSqlPreview('+idx+')">';
+            if (hasLim) h += '<label class="dt-sqlb-label" style="margin-left:12px">LIMIT</label><input type="number" id="sqllim_'+idx+'" value="10" min="1" class="dt-sqlb-input dt-sqlb-num" oninput="updateSqlPreview('+idx+')">';
+            h += '</div></div>';
+          }
+
+          // One row per optional WHERE condition
+          if (conds.length > 0) {
+            h += '<div class="dt-sqlb-sec"><div class="dt-sqlb-sec-title">選填 WHERE 條件 <span class="dt-sqlb-sec-hint">（勾選即啟用，未勾選的條件從 SQL 中移除）</span></div>';
+            conds.forEach(function(c, ci) {
+              var preview = c.cond.length > 72 ? c.cond.substring(0, 69) + '…' : c.cond;
+              h += '<div class="dt-sqlb-row">';
+              h += '<input type="checkbox" id="sqlcb_'+idx+'_'+ci+'" class="dt-sqlb-cb"'+(c.defaultOn?' checked':'')+' oninput="updateSqlPreview('+idx+')">';
+              h += '<label for="sqlcb_'+idx+'_'+ci+'" class="dt-sqlb-cond-name">'+escHtml(c.dispName)+'</label>';
+              if (c.vn) {
+                h += '<span class="dt-sqlb-eq">=</span>';
+                h += '<input type="text" id="sqlvi_'+idx+'_'+ci+'" placeholder="輸入值…" class="dt-sqlb-input dt-sqlb-val" oninput="updateSqlPreview('+idx+')">';
+              }
+              h += '<span class="dt-sqlb-hint">→ <code style="font-size:10px;background:transparent;color:#8b949e;padding:0">'+escHtml(preview)+'</code></span>';
+              h += '</div>';
+            });
+            h += '</div>';
+          }
+
+          // Fixed inline value placeholders that are not part of conditional blocks
+          if (inlines.length > 0) {
+            h += '<div class="dt-sqlb-sec"><div class="dt-sqlb-sec-title">其他參數（固定條件）</div>';
+            inlines.forEach(function(p, pi) {
+              h += '<div class="dt-sqlb-row">';
+              h += '<label class="dt-sqlb-cond-name">'+escHtml(p.n)+'</label>';
+              h += '<span class="dt-sqlb-eq">=</span>';
+              h += '<input type="text" id="sqlil_'+idx+'_'+pi+'" placeholder="輸入值…" class="dt-sqlb-input dt-sqlb-val" oninput="updateSqlPreview('+idx+')">';
+              h += '</div>';
+            });
+            h += '</div>';
+          }
+
+          // Live preview pane + copy button
+          h += '<div class="dt-sqlb-preview-hdr">';
+          h += '<span class="dt-sqlb-preview-title">預覽可執行 SQL</span>';
+          h += '<button id="sqlcopybtn_'+idx+'" class="dt-sqlb-copy-btn" onclick="copySqlPreview('+idx+')">📋 複製 SQL</button>';
+          h += '</div>';
+          h += '<pre class="dt-sql-code dt-sqlb-pre" id="sqlpre_'+idx+'">'+escHtml(initSql)+'</pre>';
+          h += '</div>';
+          return h;
+        }
+
         // ═══ API Detail New Tab ═══
         function openApiDetailTab(endpoint, allData) {
+          // Hoist layer colour mapping to a single lookup to avoid duplication across
+          // the trace flow, logic table, and step card sections below.
+          var LAYER_COLORS = {
+            'Handler':    '#58a6ff', 'Controller': '#58a6ff',
+            'Service':    '#3fb950', 'Repository': '#d29922',
+            'External':   '#bc8cff'
+          };
+          function layerColor(layer) { return LAYER_COLORS[layer] || '#8b949e'; }
+
           var ep = typeof endpoint === 'string' ? JSON.parse(endpoint) : endpoint;
           var trace = (allData && allData.apiTraces || []).find(function(t) {
             return t.method === ep.method && t.path === ep.path;
@@ -1912,12 +2068,11 @@ public class HtmlDashboardGenerator
             // Build HTML flow diagram for execution trace
             traceHtml = '<div class="dt-trace-flow">';
             trace.steps.forEach(function(step, i) {
-              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922',
-                'Controller':'#58a6ff','External':'#bc8cff'}[step.layer]||'#8b949e';
+              var lc = layerColor(step.layer);
               traceHtml += '<div class="dt-trace-item">';
-              traceHtml += '<div class="dt-trace-badge" style="background:'+layerColor+'22;border:1px solid '+layerColor+'44;color:'+layerColor+'">'+escHtml(step.layer)+'</div>';
+              traceHtml += '<div class="dt-trace-badge" style="background:'+lc+'22;border:1px solid '+lc+'44;color:'+lc+'">'+escHtml(step.layer)+'</div>';
               traceHtml += '<div class="dt-trace-body">';
-              traceHtml += '<div class="dt-trace-num" style="color:'+layerColor+'">'+step.order+'</div>';
+              traceHtml += '<div class="dt-trace-num" style="color:'+lc+'">'+step.order+'</div>';
               traceHtml += '<div class="dt-trace-content">';
               traceHtml += '<code class="dt-trace-file">'+escHtml(step.file||'')+'</code>';
               traceHtml += '<strong class="dt-trace-fn">'+escHtml(step.function||'')+'</strong>';
@@ -1934,13 +2089,12 @@ public class HtmlDashboardGenerator
               + '<th>檔案路徑</th><th>函式名稱</th><th style="width:120px">程式碼行數</th><th>功能說明</th>'
               + '</tr></thead><tbody>';
             trace.steps.forEach(function(step) {
-              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922',
-                'Controller':'#58a6ff','External':'#bc8cff'}[step.layer]||'#8b949e';
+              var lc = layerColor(step.layer);
               var lineRange = (step.startLine && step.endLine)
                 ? 'L' + step.startLine + '–' + step.endLine : '—';
               logicHtml += '<tr>';
-              logicHtml += '<td style="color:'+layerColor+';font-weight:700">'+step.order+'</td>';
-              logicHtml += '<td><span class="dt-badge" style="background:'+layerColor+'22;color:'+layerColor+';border:1px solid '+layerColor+'44">'+escHtml(step.layer)+'</span></td>';
+              logicHtml += '<td style="color:'+lc+';font-weight:700">'+step.order+'</td>';
+              logicHtml += '<td><span class="dt-badge" style="background:'+lc+'22;color:'+lc+';border:1px solid '+lc+'44">'+escHtml(step.layer)+'</span></td>';
               logicHtml += '<td><code style="font-size:11px;word-break:break-all">'+escHtml(step.file)+'</code></td>';
               logicHtml += '<td><strong>'+escHtml(step.function)+'</strong></td>';
               logicHtml += '<td style="font-family:var(--mono);font-size:11px;color:#8b949e">'+escHtml(lineRange)+'</td>';
@@ -1952,10 +2106,9 @@ public class HtmlDashboardGenerator
             // Append called functions summary
             logicHtml += '<div class="dt-steps">';
             trace.steps.forEach(function(step, idx) {
-              var layerColor = {'Handler':'#58a6ff','Service':'#3fb950','Repository':'#d29922',
-                'Controller':'#58a6ff','External':'#bc8cff'}[step.layer]||'#8b949e';
-              logicHtml += '<div class="dt-step"><div class="dt-step-num" style="background:'+layerColor+'">'+step.order+'</div>';
-              logicHtml += '<div class="dt-step-body"><div class="dt-step-layer" style="color:'+layerColor+'">'+escHtml(step.layer)+'</div>';
+              var lc = layerColor(step.layer);
+              logicHtml += '<div class="dt-step"><div class="dt-step-num" style="background:'+lc+'">'+step.order+'</div>';
+              logicHtml += '<div class="dt-step-body"><div class="dt-step-layer" style="color:'+lc+'">'+escHtml(step.layer)+'</div>';
               logicHtml += '<code class="dt-step-file">'+escHtml(step.file);
               if (step.startLine) logicHtml += ' <span style="color:#8b949e">:'+step.startLine+'–'+step.endLine+'</span>';
               logicHtml += '</code>';
@@ -1975,7 +2128,7 @@ public class HtmlDashboardGenerator
             sqlHtml = '<p style="color:#8b949e;font-size:12px;margin-bottom:16px">共偵測到 <strong style="color:#e6edf3">'
               + trace.sqlQueries.length + '</strong> 個 SQL 語法</p>';
             sqlHtml += '<div class="dt-sql-list">';
-            trace.sqlQueries.forEach(function(q) {
+            trace.sqlQueries.forEach(function(q, qIdx) {
               var opColor = {'SELECT':'#3fb950','INSERT':'#58a6ff','UPDATE':'#d29922','DELETE':'#f85149'}[q.operation]||'#8b949e';
               sqlHtml += '<div class="dt-sql-item">';
               sqlHtml += '<div class="dt-sql-header"><span class="dt-badge" style="background:'+opColor+'22;color:'+opColor+';border:1px solid '+opColor+'44">'+escHtml(q.operation)+'</span> ';
@@ -1993,10 +2146,12 @@ public class HtmlDashboardGenerator
               // Raw SQL
               sqlHtml += '<div style="padding:8px 16px 2px;font-size:11px;color:#8b949e;text-transform:uppercase">原始 SQL</div>';
               sqlHtml += '<pre class="dt-sql-code">'+escHtml(q.rawSql)+'</pre>';
-              // Composed SQL (with param annotations)
+              // Interactive SQL builder: replaces the static composed-SQL block.
+              // Parses conditional validate-flag patterns and renders an interactive
+              // form where the user can toggle conditions, fill in values, and copy
+              // a clean, directly-executable SQL statement.
               if (q.composedSql && q.composedSql !== q.rawSql) {
-                sqlHtml += '<div style="padding:8px 16px 2px;font-size:11px;color:#d29922;text-transform:uppercase">組合後可執行 SQL（含參數佔位值）</div>';
-                sqlHtml += '<pre class="dt-sql-code" style="border-top:1px solid var(--border)">'+escHtml(q.composedSql)+'</pre>';
+                sqlHtml += buildSqlInteractorHtml(q.composedSql, qIdx);
               }
               sqlHtml += '</div>';
             });
@@ -2027,6 +2182,59 @@ public class HtmlDashboardGenerator
             + '<div id="dt-sql" class="dt-panel hidden">'+sqlHtml+'</div>'
             + '</div>'
             + '<script>'
+            + 'if(!window._sqlBd)window._sqlBd={};'
+            // updateSqlPreview: re-generates the clean SQL preview from current form state.
+            // Uses indexOf on the ORIGINAL sql string to find each condition's position,
+            // then applies replacements right-to-left via slice() — this prevents the
+            // in-place mutation bug where condition A's replacement text could accidentally
+            // match condition B's search pattern.
+            + 'function updateSqlPreview(idx){'
+            + 'var d=window._sqlBd[idx];if(!d)return;'
+            + 'var original=d.sql;'
+            // Collect {from, to, text} for each condition, using position in *original*
+            + 'var reps=[];'
+            + 'd.conds.forEach(function(c,ci){'
+            + 'var pos=original.indexOf(c.full);if(pos===-1)return;'
+            + 'var cb=document.getElementById("sqlcb_"+idx+"_"+ci);'
+            + 'var vi=document.getElementById("sqlvi_"+idx+"_"+ci);'
+            + 'var checked=cb&&cb.checked;'
+            + 'var cond=c.cond;'
+            // Substitute value placeholder with user-entered text
+            + 'if(checked&&c.vn&&vi&&vi.value.trim()){'
+            + 'var v=vi.value.trim();cond=cond.split("\'"+c.vn+"_value\'").join("\'"+v+"\'");}'
+            + 'reps.push({from:pos,to:pos+c.full.length,text:checked?"AND "+cond:""});});'
+            // Apply right-to-left so earlier positions remain stable under slice()
+            + 'reps.sort(function(a,b){return b.from-a.from;});'
+            + 'var sql=original;'
+            + 'reps.forEach(function(r){sql=sql.slice(0,r.from)+r.text+sql.slice(r.to);});'
+            // OFFSET/LIMIT: case-insensitive regex replace with NaN-safe clamp
+            + 'var oi=document.getElementById("sqloff_"+idx);'
+            + 'var li=document.getElementById("sqllim_"+idx);'
+            + 'if(oi){var ov=Math.max(0,parseInt(oi.value,10)||0);sql=sql.replace(/\\bOFFSET\\s+\\$1\\b/gi,"OFFSET "+ov);}'
+            + 'if(li){var lv=Math.max(1,parseInt(li.value,10)||10);sql=sql.replace(/\\bLIMIT\\s+\\$2\\b/gi,"LIMIT "+lv);}'
+            // Inline placeholders — substitute against the already-modified sql (safe: these are
+            // non-overlapping literal tokens that were not part of any conditional block)
+            + '(d.ils||[]).forEach(function(p,pi){var ii=document.getElementById("sqlil_"+idx+"_"+pi);'
+            + 'if(ii&&ii.value.trim()){var v=ii.value.trim();sql=sql.split("\'"+p.n+"_value\'").join("\'"+v+"\'");}});'
+            // Collapse three or more consecutive blank lines into one
+            + 'sql=sql.replace(/[ \\t]*\\n([ \\t]*\\n){2,}/g,"\\n\\n").trim();'
+            + 'var el=document.getElementById("sqlpre_"+idx);if(el)el.textContent=sql;}'
+            // copySqlPreview: copies the current preview text to the clipboard.
+            + 'function copySqlPreview(idx){'
+            + 'var el=document.getElementById("sqlpre_"+idx);'
+            + 'var btn=document.getElementById("sqlcopybtn_"+idx);'
+            + 'if(!el)return;var txt=el.textContent;'
+            + 'var ok=function(){if(btn){btn.textContent="✅ 已複製";setTimeout(function(){btn.textContent="📋 複製 SQL";},2000);}};'
+            + 'if(navigator.clipboard){navigator.clipboard.writeText(txt).then(ok).catch(function(){fbCopy(txt,ok);});}else{fbCopy(txt,ok);}}'
+            // fbCopy: textarea-based clipboard fallback for environments without Clipboard API.
+            // Uses a hidden, non-interactive textarea so execCommand targets the right element.
+            + 'function fbCopy(txt,ok){'
+            + 'var ta=document.createElement("textarea");ta.value=txt;'
+            + 'ta.setAttribute("readonly","");'
+            + 'ta.style.cssText="position:fixed;top:0;left:0;opacity:0;pointer-events:none";'
+            + 'document.body.appendChild(ta);ta.select();'
+            + 'try{document.execCommand("copy");ok();}catch(e){}'
+            + 'document.body.removeChild(ta);}'
             + 'function switchDtTab(btn,panelId){'
             + 'document.querySelectorAll(".dt-tab").forEach(function(t){t.classList.remove("active")});'
             + 'document.querySelectorAll(".dt-panel").forEach(function(p){p.classList.add("hidden")});'
@@ -2039,9 +2247,12 @@ public class HtmlDashboardGenerator
           // prevents DOM-clobbering / CSP bypass issues from cross-window document manipulation.
           var blob = new Blob([html], {type: 'text/html'});
           var blobUrl = URL.createObjectURL(blob);
-          var w = window.open(blobUrl, '_blank');
-          // Revoke the object URL after the window has had time to load it
-          if (w) { w.addEventListener('load', function(){ URL.revokeObjectURL(blobUrl); }); }
+          // noopener prevents the child window from accessing window.opener (tab-nabbing).
+          // Blob URL has an opaque origin, but noopener eliminates the reference entirely.
+          var w = window.open(blobUrl, '_blank', 'noopener,noreferrer');
+          // Revoke the object URL after a short delay — addEventListener('load') is
+          // unavailable on noopener windows because window.open returns null in that case.
+          setTimeout(function(){ URL.revokeObjectURL(blobUrl); }, 5000);
         }
 
         function getDtStyles() {
@@ -2101,34 +2312,34 @@ public class HtmlDashboardGenerator
             + '.dt-resp-desc{font-size:13px;color:var(--text)}'
             + '.dt-resp-ct{font-size:11px;color:var(--muted);margin-left:auto;font-family:var(--mono)}'
             + '.dt-resp-schema-label{padding:6px 14px 2px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}'
-            + '.dt-resp-schema{margin:0;padding:10px 14px;font-size:12px;background:var(--bg2);color:#c9d1d9;overflow:auto;max-height:300px;line-height:1.6;white-space:pre}';
+            + '.dt-resp-schema{margin:0;padding:10px 14px;font-size:12px;background:var(--bg2);color:#c9d1d9;overflow:auto;max-height:300px;line-height:1.6;white-space:pre}'
+            // ── Interactive SQL Builder widget styles ──────────────────────────
+            + '.dt-sqlb{padding:16px;border-top:1px solid var(--border)}'
+            + '.dt-sqlb-hdr{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:12px}'
+            + '.dt-sqlb-hdr-title{font-size:13px;font-weight:700;color:#e3b341}'
+            + '.dt-sqlb-hdr-hint{font-size:11px;color:var(--muted)}'
+            + '.dt-sqlb-sec{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:10px}'
+            + '.dt-sqlb-sec-title{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}'
+            + '.dt-sqlb-sec-hint{font-weight:400;text-transform:none;letter-spacing:0}'
+            + '.dt-sqlb-row{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:4px 0;border-bottom:1px solid rgba(48,54,61,.5)}'
+            + '.dt-sqlb-row:last-child{border-bottom:none}'
+            + '.dt-sqlb-cb{width:14px;height:14px;cursor:pointer;flex-shrink:0;accent-color:var(--blue)}'
+            + '.dt-sqlb-label{font-size:12px;color:var(--muted);min-width:48px}'
+            + '.dt-sqlb-cond-name{font-size:12px;font-family:var(--mono);color:var(--blue);min-width:160px}'
+            + '.dt-sqlb-eq{font-size:12px;color:var(--muted)}'
+            + '.dt-sqlb-input{background:var(--card);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:12px;padding:3px 8px;outline:none}'
+            + '.dt-sqlb-input:focus{border-color:var(--blue)}'
+            + '.dt-sqlb-num{width:80px}'
+            + '.dt-sqlb-val{width:200px}'
+            + '.dt-sqlb-hint{font-size:11px;color:var(--muted);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
+            + '.dt-sqlb-preview-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}'
+            + '.dt-sqlb-preview-title{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}'
+            + '.dt-sqlb-copy-btn{cursor:pointer;background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 12px;font-size:12px}'
+            + '.dt-sqlb-copy-btn:hover{border-color:var(--blue);color:var(--blue)}'
+            + '.dt-sqlb-pre{border:1px solid var(--border);border-radius:6px;padding:12px 16px;font-family:var(--mono);font-size:12px;line-height:1.7;color:#e6edf3;white-space:pre;overflow-x:auto;background:var(--bg2)}';
         }
 
         // ═══ Modal ═══
-        function showApiDetail(endpoint) {
-          var ep = typeof endpoint === 'string' ? JSON.parse(endpoint) : endpoint;
-          document.getElementById('modal-title').textContent = ep.method + ' ' + ep.path;
-          var html = '';
-          if (ep.summary) html += '<p style="margin-bottom:12px">' + escHtml(ep.summary) + '</p>';
-          if (ep.description) html += '<p class="text-secondary" style="margin-bottom:12px">' + escHtml(ep.description) + '</p>';
-          if (ep.parameters && ep.parameters.length) {
-            html += '<h4 style="margin-bottom:8px;font-size:13px">參數</h4><table class="data-table"><thead><tr><th>名稱</th><th>位置</th><th>類型</th><th>必填</th><th>說明</th></tr></thead><tbody>';
-            ep.parameters.forEach(function(p) {
-              html += '<tr><td><code>' + escHtml(p.name) + '</code></td><td>' + escHtml(p.location) + '</td><td>' + escHtml(p.type) + '</td><td>' + (p.required ? '✅' : '') + '</td><td>' + escHtml(p.description||'') + '</td></tr>';
-            });
-            html += '</tbody></table>';
-          }
-          if (ep.responses && ep.responses.length) {
-            html += '<h4 style="margin:12px 0 8px;font-size:13px">回應</h4><table class="data-table"><thead><tr><th>狀態碼</th><th>說明</th></tr></thead><tbody>';
-            ep.responses.forEach(function(r) {
-              html += '<tr><td><span class="tag ' + (r.statusCode.startsWith('2') ? 'tag-green' : 'tag-red') + '">' + escHtml(r.statusCode) + '</span></td><td>' + escHtml(r.description) + '</td></tr>';
-            });
-            html += '</tbody></table>';
-          }
-          document.getElementById('modal-body').innerHTML = html;
-          openModal();
-        }
-
         function showContainerDetail(container) {
           var c = typeof container === 'string' ? JSON.parse(container) : container;
           document.getElementById('modal-title').textContent = '🐳 ' + c.name;
@@ -2171,9 +2382,13 @@ public class HtmlDashboardGenerator
         function handleEscape(e) { if (e.key === 'Escape') closeModal(); }
 
         // ═══ Utils ═══
+        // Pre-computed HTML entity map — allocated once, referenced on every escHtml call.
+        // Single-pass regex replace avoids 3 intermediate string allocations of the
+        // chained-replace approach, and now also escapes single quotes to be OWASP-compliant.
+        var _ESC_HTML_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;' };
         function escHtml(str) {
-          if (!str) return '';
-          return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+          if (str === null || str === undefined) return '';
+          return String(str).replace(/[&<>"']/g, function(ch) { return _ESC_HTML_MAP[ch]; });
         }
 
         // ═══ Console Error Prevention ═══

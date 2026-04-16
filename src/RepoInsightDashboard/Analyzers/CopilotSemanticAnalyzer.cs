@@ -129,7 +129,9 @@ public class CopilotSemanticAnalyzer
         // IsNullOrWhiteSpace guard prevents a whitespace-only value from reaching the API
         // and causing a silent HTTP 400/422 that is swallowed by CallCopilotAsync.
         var rawModel = Environment.GetEnvironmentVariable("COPILOT_MODEL");
-        _model = string.IsNullOrWhiteSpace(rawModel) ? DefaultModel : rawModel.Trim();
+        // Apply KnownModels allowlist at construction time so _model is always a valid
+        // value for the entire object lifetime — never an unvalidated user-supplied string.
+        _model = KnownModels.Contains(rawModel?.Trim() ?? "") ? rawModel!.Trim() : DefaultModel;
 
         _http = _sharedHttp;
     }
@@ -378,7 +380,10 @@ public class CopilotSemanticAnalyzer
             if (start >= 0 && end > start)
             {
                 var json = response[start..(end + 1)];
-                var raw = JsonConvert.DeserializeObject<List<JObject>>(json) ?? [];
+                // MaxDepth=32 caps recursion depth on untrusted JSON from the AI API,
+                // preventing stack-overflow via deeply-nested JSON payloads (CWE-674).
+                var deserSettings = new JsonSerializerSettings { MaxDepth = 32 };
+                var raw = JsonConvert.DeserializeObject<List<JObject>>(json, deserSettings) ?? [];
                 return raw.Select(o => new SecurityRisk
                 {
                     Level       = o["level"]?.ToString() ?? "info",
@@ -392,7 +397,11 @@ public class CopilotSemanticAnalyzer
                 }).Where(r => !string.IsNullOrWhiteSpace(r.Title)).ToList();
             }
         }
-        catch { }
+        catch (JsonException ex)
+        {
+            // Log the structured error to stderr (never swallow silently — CWE-390).
+            Console.Error.WriteLine($"[CopilotSemanticAnalyzer] JSON parse error in DetectSecurityRisksAsync: {ex.Message}");
+        }
         return [];
     }
 

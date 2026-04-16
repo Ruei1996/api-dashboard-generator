@@ -146,6 +146,14 @@ public class ApiTraceAnalyzer
     // ═══ Public Entry Point ══════════════════════════════════════════════════
 
     /// <summary>
+    /// Returns cached file content as a single string for <paramref name="absolutePath"/>.
+    /// Re-uses the <see cref="_fileLineCache"/> by joining cached lines, avoiding a second
+    /// <c>File.ReadAllText</c> call when lines are already cached.
+    /// </summary>
+    private string GetCachedContent(string absolutePath)
+        => string.Join("\n", GetCachedLines(absolutePath));
+
+    /// <summary>
     /// Returns cached lines for <paramref name="absolutePath"/>, reading from disk on first access.
     /// Silently returns an empty array if the file cannot be read (no exception propagates).
     /// </summary>
@@ -1817,16 +1825,14 @@ public class ApiTraceAnalyzer
         return cands.Distinct().ToList();
     }
 
-    private static string DetectTsFramework(string filePath)
+    // Instance method — uses GetCachedContent so the file is never re-read from disk
+    // when it was already loaded for handler/service layer tracing.
+    private string DetectTsFramework(string filePath)
     {
-        try
-        {
-            var content = File.ReadAllText(filePath);
-            if (content.Contains("@nestjs")) return "NestJS";
-            if (content.Contains("fastify")) return "Fastify";
-            if (content.Contains("express")) return "Express";
-        }
-        catch { }
+        var content = GetCachedContent(filePath);
+        if (content.Contains("@nestjs")) return "NestJS";
+        if (content.Contains("fastify")) return "Fastify";
+        if (content.Contains("express")) return "Express";
         return "Node.js";
     }
 
@@ -2148,11 +2154,14 @@ public class ApiTraceAnalyzer
     private static (string body, int startLine, int endLine) ExtractFunctionBodyWithLines(
         string[] lines, string funcName, int funcLine)
     {
-        // Scan near funcLine for the actual function signature
+        // Scan near funcLine for the actual function signature.
+        // string.Contains pre-filter avoids constructing and executing the dynamic Regex
+        // on lines that clearly cannot match (hot path: 600+ calls per analysis run).
         int funcStart = funcLine - 1;
         int scanFrom = Math.Max(0, funcLine - 2);
         for (int i = scanFrom; i < Math.Min(scanFrom + 6, lines.Length); i++)
         {
+            if (!lines[i].Contains(funcName)) continue;
             if (Regex.IsMatch(lines[i],
                 $@"(?:func|def|function|fun)\s+(?:\([^)]*\)\s+)?{Regex.Escape(funcName)}\s*[\(<]|" +
                 $@"(?:public|private|protected|internal).*\b{Regex.Escape(funcName)}\s*\(|" +
@@ -2192,16 +2201,14 @@ public class ApiTraceAnalyzer
         return (sb.ToString(), funcStart + 1, endLine);
     }
 
-    private static int FindFunctionLineInFile(FileNode file, string funcName)
+    // Instance method — uses GetCachedLines so the file is not re-read from disk
+    // when already loaded during handler tracing for PHP/Ruby routes.
+    private int FindFunctionLineInFile(FileNode file, string funcName)
     {
-        try
-        {
-            var lines = File.ReadAllLines(file.AbsolutePath);
-            for (int i = 0; i < lines.Length; i++)
-                if (Regex.IsMatch(lines[i], $@"\b{Regex.Escape(funcName)}\b"))
-                    return i + 1;
-        }
-        catch { }
+        var lines = GetCachedLines(file.AbsolutePath);
+        for (int i = 0; i < lines.Length; i++)
+            if (Regex.IsMatch(lines[i], $@"\b{Regex.Escape(funcName)}\b"))
+                return i + 1;
         return 1;
     }
 
