@@ -423,4 +423,6 @@ FodyWeavers.xsd
 # Claude AI files
 .claude
 
+.vscode
+
 # End of https://www.toptal.com/developers/gitignore/api/csharp
